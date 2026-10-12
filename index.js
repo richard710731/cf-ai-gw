@@ -115,6 +115,7 @@ function normalizeMessages(messages) {
 }
 
 function buildUpstreamBody(body, model) {
+  console.log("Request stream:", body.stream);
   const output = {
     ...body,
     model: model.id,
