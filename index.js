@@ -1,4 +1,3 @@
-
 import http from "node:http";
 import { once } from "node:events";
 
@@ -119,7 +118,7 @@ function buildUpstreamBody(body, model) {
   const output = {
     ...body,
     model: model.id,
-    messages: normalizeMessages(body.messages),
+    messages: body.messages,
     stream: body.stream !== false
   };
 
