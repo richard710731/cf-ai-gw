@@ -120,7 +120,7 @@ function buildUpstreamBody(body, model) {
     ...body,
     model: model.id,
     messages: body.messages,
-    stream: body.stream !== false
+    stream: body.stream === true
   };
 
   let requested = body.max_completion_tokens ?? body.max_tokens ?? null;
