@@ -1,7 +1,8 @@
+
 import http from "node:http";
 import { once } from "node:events";
 
-const VERSION = "V4.36-OPT-RENDER";
+const VERSION = "V4.34-OPT-RENDER";
 const PROVIDER = "freeaipower";
 const DEFAULT_MAX_TOKENS = 8192;
 const MAX_REQUEST_BYTES = 20 * 1024 * 1024;
@@ -54,7 +55,7 @@ function getModelKey(name) {
     if (model.id.toLowerCase() === value) return key;
   }
   if (value.includes("qwen3-30b")) return "qwen";
-  if (value.includes("granite-4.0")) return "granite";
+  if (value.includes("granite-4.0") || value.includes("ibm-granite")) return "granite";
   if (value.includes("glm-4.7-flash")) return "glm";
   if (value.includes("gemma-4-26b")) return "gemma";
   return null;
@@ -93,70 +94,111 @@ async function readRequestBody(req) {
   }
 }
 
+// Normalize OpenAI text content arrays while preserving all other
+// message fields, including tool_calls, tool_call_id and names.
+function normalizeMessages(messages) {
+  if (!Array.isArray(messages)) return messages;
+  return messages.map(message => {
+    if (!message || typeof message !== "object" || Array.isArray(message)) {
+      return message;
+    }
+    const content = message.content;
+    if (!Array.isArray(content)) return message;
+    const normalizedContent = content.map(item => {
+      if (typeof item === "string") return item;
+      if (!item || typeof item !== "object") return "";
+      if (item.text !== undefined && item.text !== null) return String(item.text);
+      if (item.content !== undefined && item.content !== null) return String(item.content);
+      return "";
+    }).join("\n");
+    return { ...message, content: normalizedContent };
+  });
+}
+
 function buildUpstreamBody(body, model) {
-  const output = { ...body, model: model.id, stream: body.stream !== false };
+  const output = {
+    ...body,
+    model: model.id,
+    messages: normalizeMessages(body.messages),
+    stream: body.stream !== false
+  };
+
   let requested = body.max_completion_tokens ?? body.max_tokens ?? null;
   if (requested !== null) {
     requested = Number(requested);
     if (!Number.isFinite(requested) || requested <= 0) requested = null;
   }
+
   const resolved = Math.min(requested || DEFAULT_MAX_TOKENS, model.maxOutputTokens);
   delete output.max_tokens;
   delete output.max_completion_tokens;
-  output.max_tokens = resolved;
+  output.max_tokens = Math.floor(resolved);
   return output;
 }
 
 function normalizePrimitive(value) {
-  return typeof value === "number" || typeof value === "boolean" ? String(value) : value;
+  return typeof value === "number" || typeof value === "boolean"
+    ? String(value)
+    : value;
 }
 
+// Returns true when any normalization changed the response.
 function normalizeResponseObject(data, modelId) {
-  if (!data || typeof data !== "object" || Array.isArray(data)) return data;
-  data.model = modelId;
+  if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+  let changed = false;
+
+  if (data.model !== modelId) {
+    data.model = modelId;
+    changed = true;
+  }
 
   if (Array.isArray(data.choices)) {
     for (const choice of data.choices) {
-      if (!choice || typeof choice !== "object") continue;
-      delete choice.matched_stop;
-      delete choice.token_ids;
+      if (!choice || typeof choice !== "object" || Array.isArray(choice)) continue;
 
-      const delta = choice.delta;
-      if (delta && typeof delta === "object" && !Array.isArray(delta)) {
-        for (const [key, value] of Object.entries(delta)) {
-          if (value === null) {
-            delete delta[key];
-          } else if (
-            key === "content" ||
-            key === "reasoning" ||
-            key === "reasoning_content"
-          ) {
-            delta[key] = normalizePrimitive(value);
-          }
-        }
+      if ("matched_stop" in choice) {
+        delete choice.matched_stop;
+        changed = true;
+      }
+      if ("token_ids" in choice) {
+        delete choice.token_ids;
+        changed = true;
       }
 
-      const message = choice.message;
-      if (message && typeof message === "object" && !Array.isArray(message)) {
-        for (const [key, value] of Object.entries(message)) {
-          if (value === null && key === "reasoning_content") {
-            delete message[key];
-          } else if (
-            key === "content" ||
-            key === "reasoning" ||
-            key === "reasoning_content"
+      for (const field of ["delta", "message"]) {
+        const obj = choice[field];
+        if (!obj || typeof obj !== "object" || Array.isArray(obj)) continue;
+
+        for (const [key, value] of Object.entries(obj)) {
+          // Preserve null content and other fields; remove null reasoning
+          // fields only, which may be rejected by strict clients.
+          if (key === "reasoning_content" && value === null) {
+            delete obj[key];
+            changed = true;
+            continue;
+          }
+
+          if (
+            ["content", "reasoning", "reasoning_content"].includes(key) &&
+            value !== null
           ) {
-            message[key] = normalizePrimitive(value);
+            const normalized = normalizePrimitive(value);
+            if (normalized !== value) {
+              obj[key] = normalized;
+              changed = true;
+            }
           }
         }
       }
     }
   }
 
-  if (data.usage && typeof data.usage === "object") {
+  if (data.usage && typeof data.usage === "object" && "neurons" in data.usage) {
     delete data.usage.neurons;
+    changed = true;
   }
-  return data;
+
+  return changed;
 }
 
 function normalizeSSEFrame(frame, modelId, state) {
@@ -170,6 +212,7 @@ function normalizeSSEFrame(frame, modelId, state) {
     if (!line.startsWith("data:")) return line;
     const raw = line.slice(5).trim();
     if (!raw) return line;
+
     if (raw === "[DONE]") {
       state.receivedDone = true;
       return line;
@@ -181,23 +224,27 @@ function normalizeSSEFrame(frame, modelId, state) {
     } catch {
       return line;
     }
-    if (!chunk || typeof chunk !== "object") return line;
 
-    const before = JSON.stringify(chunk);
-    normalizeResponseObject(chunk, modelId);
-    const after = JSON.stringify(chunk);
-    if (before !== after) changed = true;
-    return `data: ${after}`;
+    if (!chunk || typeof chunk !== "object" || Array.isArray(chunk)) return line;
+
+    if (!normalizeResponseObject(chunk, modelId)) return line;
+    changed = true;
+    return `data: ${JSON.stringify(chunk)}`;
   });
 
-  if (!changed) return frame;
-  return normalizedLines.join("\n") + ending;
+  return changed ? normalizedLines.join("\n") + ending : frame;
 }
 
 async function writeWithBackpressure(res, data) {
   if (res.destroyed || res.writableEnded) return false;
   if (res.write(data)) return true;
-  await once(res, "drain");
+
+  // Stop waiting if the client disconnects before drain.
+  await Promise.race([
+    once(res, "drain"),
+    once(res, "close")
+  ]).catch(() => {});
+
   return !res.destroyed && !res.writableEnded;
 }
 
@@ -213,7 +260,8 @@ async function streamUpstream(upstream, res, modelId) {
   });
 
   if (!upstream.body) {
-    res.end("data: [DONE]\n\n");
+    await writeWithBackpressure(res, "data: [DONE]\n\n");
+    if (!res.destroyed && !res.writableEnded) res.end();
     return;
   }
 
@@ -237,6 +285,7 @@ async function streamUpstream(upstream, res, modelId) {
         const end = match.index + match[0].length;
         const frame = buffer.slice(0, end);
         buffer = buffer.slice(end);
+
         const normalized = normalizeSSEFrame(frame, modelId, state);
         if (!(await writeWithBackpressure(res, normalized))) {
           await reader.cancel().catch(() => {});
@@ -250,17 +299,30 @@ async function streamUpstream(upstream, res, modelId) {
     }
 
     buffer += decoder.decode();
+
     if (buffer) {
+      // A final event may arrive without its terminating blank line.
+      // Add a delimiter so the next [DONE] cannot merge into its data.
       const normalized = normalizeSSEFrame(buffer, modelId, state);
-      if (!(await writeWithBackpressure(res, normalized))) return;
+      const finalFrame = /\r?\n\r?\n$/.test(normalized)
+        ? normalized
+        : normalized + "\n\n";
+
+      if (!(await writeWithBackpressure(res, finalFrame))) return;
+
+      // A final event might itself contain [DONE].
+      if (/\bdata:\s*\[DONE\]/.test(buffer)) state.receivedDone = true;
     }
+
     if (!state.receivedDone) {
       await writeWithBackpressure(res, "data: [DONE]\n\n");
     }
+
     if (!res.writableEnded && !res.destroyed) res.end();
   } catch (error) {
     console.error("SSE stream error:", error?.message || String(error));
     if (!res.destroyed && !res.writableEnded) res.destroy(error);
+    await reader.cancel().catch(() => {});
   } finally {
     reader.releaseLock();
   }
@@ -269,7 +331,11 @@ async function streamUpstream(upstream, res, modelId) {
 async function handleChatCompletions(req, res) {
   const credentials = parseCredentials(req);
   if (!credentials) {
-    return sendError(res, "Missing or invalid Authorization. Use Bearer ACCOUNT_ID:API_TOKEN.", 401);
+    return sendError(
+      res,
+      "Missing or invalid Authorization. Use Bearer ACCOUNT_ID:API_TOKEN.",
+      401
+    );
   }
 
   let body;
@@ -297,44 +363,78 @@ async function handleChatCompletions(req, res) {
 
   const model = MODELS[modelKey];
   const upstreamBody = buildUpstreamBody(body, model);
-  const upstreamUrl = `${UPSTREAM_BASE}/${encodeURIComponent(credentials.accountId)}/ai/v1/chat/completions`;
+  const upstreamUrl =
+    `${UPSTREAM_BASE}/${encodeURIComponent(credentials.accountId)}/ai/v1/chat/completions`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 300000);
+  timeout.unref?.();
+
+  // Abort the upstream request when the client disconnects.
+  const onClientClose = () => {
+    if (!res.writableEnded) controller.abort();
+  };
+  res.on("close", onClientClose);
 
   let upstream;
   try {
     upstream = await fetch(upstreamUrl, {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${credentials.apiToken}`,
+        Authorization: `Bearer ${credentials.apiToken}`,
         "Content-Type": "application/json",
-        "Accept": upstreamBody.stream ? "text/event-stream" : "application/json"
+        Accept: upstreamBody.stream ? "text/event-stream" : "application/json"
       },
       body: JSON.stringify(upstreamBody),
-      signal: AbortSignal.timeout(300000)
+      signal: controller.signal
     });
   } catch (error) {
+    clearTimeout(timeout);
+    res.off("close", onClientClose);
+
+    if (error?.name === "AbortError" && res.destroyed) return;
+
     console.error("Upstream request error:", error?.message || String(error));
-    return sendError(res, `Cloudflare upstream request failed: ${error?.message || String(error)}`, 502, "upstream_error");
+    return sendError(
+      res,
+      `Cloudflare upstream request failed: ${error?.message || String(error)}`,
+      502,
+      "upstream_error"
+    );
   }
 
+  clearTimeout(timeout);
+  res.off("close", onClientClose);
+
   const isStreaming = upstreamBody.stream === true;
-  if (isStreaming && upstream.headers.get("content-type")?.includes("text/event-stream")) {
+  if (
+    isStreaming &&
+    upstream.headers.get("content-type")?.includes("text/event-stream")
+  ) {
     return streamUpstream(upstream, res, model.id);
   }
 
   const raw = await upstream.text();
   let data;
+
   try {
     data = JSON.parse(raw);
   } catch {
-    return sendJson(res, {
-      error: {
-        message: raw || `Cloudflare returned HTTP ${upstream.status}.`,
-        type: "upstream_error"
-      }
-    }, upstream.ok ? 502 : upstream.status);
+    return sendJson(
+      res,
+      {
+        error: {
+          message: raw || `Cloudflare returned HTTP ${upstream.status}.`,
+          type: "upstream_error"
+        }
+      },
+      upstream.ok ? 502 : upstream.status,
+      { "X-Proxy-Model": model.id }
+    );
   }
 
   if (!upstream.ok) {
+    // Keep Cloudflare's original error details for diagnosis.
     return sendJson(res, data, upstream.status, { "X-Proxy-Model": model.id });
   }
 
@@ -346,7 +446,14 @@ async function handleChatCompletions(req, res) {
 }
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  let url;
+
+  try {
+    url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  } catch {
+    return sendError(res, "Invalid request URL.", 400);
+  }
+
   const path = url.pathname;
 
   if (req.method === "OPTIONS") {
@@ -354,7 +461,7 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  if (req.method === "GET" && (path === "/" || path === "/ping" || path === "/health")) {
+  if (req.method === "GET" && ["/", "/ping", "/health"].includes(path)) {
     return sendJson(res, {
       status: "ok",
       version: VERSION,
@@ -363,11 +470,14 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  if (req.method === "GET" && (path === "/models" || path === "/v1/models")) {
+  if (req.method === "GET" && ["/models", "/v1/models"].includes(path)) {
     return sendJson(res, { object: "list", data: buildModelList() });
   }
 
-  if (req.method === "POST" && (path === "/chat/completions" || path === "/v1/chat/completions")) {
+  if (
+    req.method === "POST" &&
+    ["/chat/completions", "/v1/chat/completions"].includes(path)
+  ) {
     return handleChatCompletions(req, res);
   }
 
@@ -375,7 +485,12 @@ const server = http.createServer(async (req, res) => {
     return sendError(res, `Not found: ${path}`, 404, "not_found_error");
   }
 
-  return sendError(res, `Unsupported route: ${req.method} ${path}`, 404, "not_found_error");
+  return sendError(
+    res,
+    `Unsupported route: ${req.method} ${path}`,
+    404,
+    "not_found_error"
+  );
 });
 
 server.requestTimeout = 300000;
@@ -383,8 +498,11 @@ server.headersTimeout = 60000;
 server.keepAliveTimeout = 65000;
 
 const PORT = Number(process.env.PORT) || 3000;
+
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`${VERSION} listening on port ${PORT}; provider=${PROVIDER}; models=${Object.keys(MODELS).join(",")}`);
+  console.log(
+    `${VERSION} listening on port ${PORT}; provider=${PROVIDER}; models=${Object.keys(MODELS).join(",")}`
+  );
 });
 
 server.on("error", error => {
