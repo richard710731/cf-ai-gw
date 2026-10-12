@@ -115,13 +115,17 @@ function normalizeMessages(messages) {
 }
 
 function buildUpstreamBody(body, model) {
-  console.log("Request stream:", body.stream);
+  //console.log("Request stream:", body.stream);
   const output = {
     ...body,
     model: model.id,
     messages: body.messages,
     stream: body.stream === true
   };
+
+  if (model.id === "@cf/zai-org/glm-4.7-flash") {
+    delete output.reasoning_effort;
+  }
 
   let requested = body.max_completion_tokens ?? body.max_tokens ?? null;
   if (requested !== null) {
