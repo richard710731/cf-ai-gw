@@ -1,0 +1,12 @@
+{
+  "name": "workers-ai-openai-proxy",
+  "version": "4.34.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node index.js"
+  }
+}
