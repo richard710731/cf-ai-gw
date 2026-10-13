@@ -463,11 +463,30 @@ async function handleChatCompletions(req, res) {
       { "X-Proxy-Model": model.id }
     );
   }
-
+/*
   if (!upstream.ok) {
     return sendJson(res, data, upstream.status, { "X-Proxy-Model": model.id });
   }
-
+*/
+  
+if (!upstream.ok) {
+  if (modelKey === "granite" && data && typeof data === "object" && !Array.isArray(data)) {
+    data.proxy_diagnostic = {
+      version: VERSION,
+      stage: "upstream_error",
+      messages: upstreamBody.messages.map((m, i) => ({
+        index: i,
+        role: m?.role ?? null,
+        contentType: m?.content === null ? "null" : Array.isArray(m?.content) ? "array" : typeof m?.content,
+        hasContent: m != null && Object.prototype.hasOwnProperty.call(m, "content"),
+        hasToolCalls: Array.isArray(m?.tool_calls) && m.tool_calls.length > 0,
+        contentLength: typeof m?.content === "string" ? m.content.length : null
+      }))
+    };
+  }
+  return sendJson(res, data, upstream.status, { "X-Proxy-Model": model.id });
+}
+  
   normalizeResponseObject(data, model.id);
   return sendJson(res, data, upstream.status, {
     "X-Proxy-Model": model.id,
