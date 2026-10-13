@@ -1,7 +1,7 @@
 import http from "node:http";
 import { once } from "node:events";
 
-const VERSION = "V4.34-OPT-RENDER";
+const VERSION = "V4.35-OPT-RENDER";
 const PROVIDER = "freeaipower";
 const DEFAULT_MAX_TOKENS = 8192;
 const MAX_REQUEST_BYTES = 20 * 1024 * 1024;
