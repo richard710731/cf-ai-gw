@@ -365,6 +365,33 @@ async function handleChatCompletions(req, res) {
     );
   }
 
+console.log("Request diagnostics:", JSON.stringify({
+  version: VERSION,
+  requestedModel: body.model,
+  resolvedModel: model.id,
+  stream: body.stream,
+  messageCount: body.messages.length,
+  messageShapes: body.messages.map(message => ({
+    role: message?.role,
+    contentType: Array.isArray(message?.content)
+      ? "array"
+      : typeof message?.content,
+    contentItems: Array.isArray(message?.content)
+      ? message.content.map(item =>
+          item && typeof item === "object"
+            ? {
+                type: item.type,
+                hasText: item.text != null,
+                hasImageUrl: item.image_url != null
+              }
+            : { type: typeof item }
+        )
+      : undefined,
+    hasToolCalls: Array.isArray(message?.tool_calls),
+    hasToolCallId: message?.tool_call_id != null
+  }))
+}));
+
   const model = MODELS[modelKey];
   const upstreamBody = buildUpstreamBody(body, model);
   const upstreamUrl =
