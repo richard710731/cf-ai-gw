@@ -93,8 +93,7 @@ async function readRequestBody(req) {
   }
 }
 
-// Normalize OpenAI text content arrays while preserving all other
-// message fields, including tool_calls, tool_call_id and names.
+// Normalize OpenAI text content arrays while preserving other message fields.
 function normalizeMessages(messages) {
   if (!Array.isArray(messages)) return messages;
   return messages.map(message => {
@@ -114,20 +113,34 @@ function normalizeMessages(messages) {
   });
 }
 
-// Granite-specific normalization:
-// ordinary message content must be a string;
-// assistant messages containing tool_calls use null content.
+// Granite-specific normalization.
+// Ordinary messages require string content.
+// Assistant messages with actual tool/function calls use null content.
 function normalizeGraniteMessages(messages) {
-  const normalized = normalizeMessages(messages);
-  if (!Array.isArray(normalized)) return normalized;
-  return normalized.map(message => {
+  if (!Array.isArray(messages)) return messages;
+  return messages.map(message => {
     if (!message || typeof message !== "object" || Array.isArray(message)) {
       return message;
     }
-    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
-      return message.content === null ? message : { ...message, content: null };
+
+    const normalized = normalizeMessages([message])[0];
+    const hasToolCalls =
+      Array.isArray(normalized.tool_calls) && normalized.tool_calls.length > 0;
+    const hasFunctionCall =
+      normalized.function_call !== null &&
+      normalized.function_call !== undefined;
+
+    if (normalized.role === "assistant" && (hasToolCalls || hasFunctionCall)) {
+      return { ...normalized, content: null };
     }
-    return message;
+
+    if (typeof normalized.content === "string") return normalized;
+
+    if (normalized.content === null || normalized.content === undefined) {
+      return { ...normalized, content: "" };
+    }
+
+    return { ...normalized, content: String(normalized.content) };
   });
 }
 
@@ -195,8 +208,6 @@ function normalizeResponseObject(data, modelId) {
         if (!obj || typeof obj !== "object" || Array.isArray(obj)) continue;
 
         for (const [key, value] of Object.entries(obj)) {
-          // Preserve null content and other fields; remove null reasoning
-          // fields only, which may be rejected by strict clients.
           if (key === "reasoning_content" && value === null) {
             delete obj[key];
             changed = true;
@@ -264,7 +275,6 @@ async function writeWithBackpressure(res, data) {
   if (res.destroyed || res.writableEnded) return false;
   if (res.write(data)) return true;
 
-  // Stop waiting if the client disconnects before drain.
   await Promise.race([
     once(res, "drain"),
     once(res, "close")
@@ -326,8 +336,6 @@ async function streamUpstream(upstream, res, modelId) {
     buffer += decoder.decode();
 
     if (buffer) {
-      // A final event may arrive without its terminating blank line.
-      // Add a delimiter so the next [DONE] cannot merge into its data.
       const normalized = normalizeSSEFrame(buffer, modelId, state);
       const finalFrame = /\r?\n\r?\n$/.test(normalized)
         ? normalized
@@ -335,7 +343,6 @@ async function streamUpstream(upstream, res, modelId) {
 
       if (!(await writeWithBackpressure(res, finalFrame))) return;
 
-      // A final event might itself contain [DONE].
       if (/\bdata:\s*\[DONE\]/.test(buffer)) state.receivedDone = true;
     }
 
@@ -395,7 +402,6 @@ async function handleChatCompletions(req, res) {
   const timeout = setTimeout(() => controller.abort(), 300000);
   timeout.unref?.();
 
-  // Abort the upstream request when the client disconnects.
   const onClientClose = () => {
     if (!res.writableEnded) controller.abort();
   };
@@ -459,7 +465,6 @@ async function handleChatCompletions(req, res) {
   }
 
   if (!upstream.ok) {
-    // Keep Cloudflare's original error details for diagnosis.
     return sendJson(res, data, upstream.status, { "X-Proxy-Model": model.id });
   }
 
