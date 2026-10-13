@@ -97,9 +97,7 @@ async function readRequestBody(req) {
 function normalizeMessages(messages) {
   if (!Array.isArray(messages)) return messages;
   return messages.map(message => {
-    if (!message || typeof message !== "object" || Array.isArray(message)) {
-      return message;
-    }
+    if (!message || typeof message !== "object" || Array.isArray(message)) return message;
     const content = message.content;
     if (!Array.isArray(content)) return message;
     const normalizedContent = content.map(item => {
@@ -113,35 +111,40 @@ function normalizeMessages(messages) {
   });
 }
 
-// Granite-specific normalization.
-// Ordinary messages require string content.
-// Assistant messages with actual tool/function calls use null content.
+// Granite-specific message compatibility.
 function normalizeGraniteMessages(messages) {
   if (!Array.isArray(messages)) return messages;
-  return messages.map(message => {
+  const normalized = [];
+  for (const message of messages) {
     if (!message || typeof message !== "object" || Array.isArray(message)) {
-      return message;
+      normalized.push(message);
+      continue;
     }
-
-    const normalized = normalizeMessages([message])[0];
-    const hasToolCalls =
-      Array.isArray(normalized.tool_calls) && normalized.tool_calls.length > 0;
-    const hasFunctionCall =
-      normalized.function_call !== null &&
-      normalized.function_call !== undefined;
-
-    if (normalized.role === "assistant" && (hasToolCalls || hasFunctionCall)) {
-      return { ...normalized, content: null };
+    const item = normalizeMessages([message])[0];
+    if (item.role === "tool") {
+      const toolName = item.name ? `: ${item.name}` : "";
+      const toolContent = typeof item.content === "string"
+        ? item.content
+        : item.content == null ? "" : String(item.content);
+      normalized.push({
+        role: "user",
+        content: `[Tool result${toolName}]\n${toolContent}`
+      });
+      continue;
     }
-
-    if (typeof normalized.content === "string") return normalized;
-
-    if (normalized.content === null || normalized.content === undefined) {
-      return { ...normalized, content: "" };
+    if (item.role === "assistant" && Array.isArray(item.tool_calls) && item.tool_calls.length > 0) {
+      normalized.push({ ...item, content: null });
+      continue;
     }
-
-    return { ...normalized, content: String(normalized.content) };
-  });
+    if (typeof item.content === "string") {
+      normalized.push(item);
+    } else if (item.content === null || item.content === undefined) {
+      normalized.push({ ...item, content: "" });
+    } else {
+      normalized.push({ ...item, content: String(item.content) });
+    }
+  }
+  return normalized;
 }
 
 function buildUpstreamBody(body, model) {
@@ -208,6 +211,8 @@ function normalizeResponseObject(data, modelId) {
         if (!obj || typeof obj !== "object" || Array.isArray(obj)) continue;
 
         for (const [key, value] of Object.entries(obj)) {
+          // Preserve null content and other fields; remove null reasoning
+          // fields only, which may be rejected by strict clients.
           if (key === "reasoning_content" && value === null) {
             delete obj[key];
             changed = true;
@@ -275,6 +280,7 @@ async function writeWithBackpressure(res, data) {
   if (res.destroyed || res.writableEnded) return false;
   if (res.write(data)) return true;
 
+  // Stop waiting if the client disconnects before drain.
   await Promise.race([
     once(res, "drain"),
     once(res, "close")
@@ -336,6 +342,8 @@ async function streamUpstream(upstream, res, modelId) {
     buffer += decoder.decode();
 
     if (buffer) {
+      // A final event may arrive without its terminating blank line.
+      // Add a delimiter so the next [DONE] cannot merge into its data.
       const normalized = normalizeSSEFrame(buffer, modelId, state);
       const finalFrame = /\r?\n\r?\n$/.test(normalized)
         ? normalized
@@ -343,6 +351,7 @@ async function streamUpstream(upstream, res, modelId) {
 
       if (!(await writeWithBackpressure(res, finalFrame))) return;
 
+      // A final event might itself contain [DONE].
       if (/\bdata:\s*\[DONE\]/.test(buffer)) state.receivedDone = true;
     }
 
@@ -402,6 +411,7 @@ async function handleChatCompletions(req, res) {
   const timeout = setTimeout(() => controller.abort(), 300000);
   timeout.unref?.();
 
+  // Abort the upstream request when the client disconnects.
   const onClientClose = () => {
     if (!res.writableEnded) controller.abort();
   };
@@ -463,30 +473,12 @@ async function handleChatCompletions(req, res) {
       { "X-Proxy-Model": model.id }
     );
   }
-/*
+
   if (!upstream.ok) {
+    // Keep Cloudflare's original error details for diagnosis.
     return sendJson(res, data, upstream.status, { "X-Proxy-Model": model.id });
   }
-*/
-  
-if (!upstream.ok) {
-  if (modelKey === "granite" && data && typeof data === "object" && !Array.isArray(data)) {
-    data.proxy_diagnostic = {
-      version: VERSION,
-      stage: "upstream_error",
-      messages: upstreamBody.messages.map((m, i) => ({
-        index: i,
-        role: m?.role ?? null,
-        contentType: m?.content === null ? "null" : Array.isArray(m?.content) ? "array" : typeof m?.content,
-        hasContent: m != null && Object.prototype.hasOwnProperty.call(m, "content"),
-        hasToolCalls: Array.isArray(m?.tool_calls) && m.tool_calls.length > 0,
-        contentLength: typeof m?.content === "string" ? m.content.length : null
-      }))
-    };
-  }
-  return sendJson(res, data, upstream.status, { "X-Proxy-Model": model.id });
-}
-  
+
   normalizeResponseObject(data, model.id);
   return sendJson(res, data, upstream.status, {
     "X-Proxy-Model": model.id,
