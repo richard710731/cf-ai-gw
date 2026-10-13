@@ -119,7 +119,8 @@ function buildUpstreamBody(body, model) {
   const output = {
     ...body,
     model: model.id,
-    messages: body.messages,
+    messages: ["qwen", "granite", "glm"].includes(getModelKey(model.id))
+      ? normalizeMessages(body.messages) : body.messages,
     stream: body.stream === true
   };
 
@@ -364,33 +365,6 @@ async function handleChatCompletions(req, res) {
       400
     );
   }
-
-console.log("Request diagnostics:", JSON.stringify({
-  version: VERSION,
-  requestedModel: body.model,
-  resolvedModel: model.id,
-  stream: body.stream,
-  messageCount: body.messages.length,
-  messageShapes: body.messages.map(message => ({
-    role: message?.role,
-    contentType: Array.isArray(message?.content)
-      ? "array"
-      : typeof message?.content,
-    contentItems: Array.isArray(message?.content)
-      ? message.content.map(item =>
-          item && typeof item === "object"
-            ? {
-                type: item.type,
-                hasText: item.text != null,
-                hasImageUrl: item.image_url != null
-              }
-            : { type: typeof item }
-        )
-      : undefined,
-    hasToolCalls: Array.isArray(message?.tool_calls),
-    hasToolCallId: message?.tool_call_id != null
-  }))
-}));
 
   const model = MODELS[modelKey];
   const upstreamBody = buildUpstreamBody(body, model);
