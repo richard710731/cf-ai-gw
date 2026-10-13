@@ -114,13 +114,33 @@ function normalizeMessages(messages) {
   });
 }
 
+// Granite-specific normalization:
+// ordinary message content must be a string;
+// assistant messages containing tool_calls use null content.
+function normalizeGraniteMessages(messages) {
+  const normalized = normalizeMessages(messages);
+  if (!Array.isArray(normalized)) return normalized;
+  return normalized.map(message => {
+    if (!message || typeof message !== "object" || Array.isArray(message)) {
+      return message;
+    }
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      return message.content === null ? message : { ...message, content: null };
+    }
+    return message;
+  });
+}
+
 function buildUpstreamBody(body, model) {
   //console.log("Request stream:", body.stream);
+  const modelKey = getModelKey(model.id);
   const output = {
     ...body,
     model: model.id,
-    messages: ["qwen", "granite", "glm"].includes(getModelKey(model.id))
-      ? normalizeMessages(body.messages) : body.messages,
+    messages: modelKey === "granite"
+      ? normalizeGraniteMessages(body.messages)
+      : ["qwen", "glm"].includes(modelKey)
+        ? normalizeMessages(body.messages) : body.messages,
     stream: body.stream === true
   };
 
