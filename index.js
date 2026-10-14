@@ -1,7 +1,7 @@
 import http from "node:http";
 import { once } from "node:events";
 
-const VERSION = "V4.44-GRANITE-SUGGEST-DIAG";
+const VERSION = "V4.45-GRANITE-STREAM-FIX";
 const PROVIDER = "freeaipower";
 const DEFAULT_MAX_TOKENS = 8192;
 const MAX_REQUEST_BYTES = 20 * 1024 * 1024;
@@ -319,7 +319,14 @@ function normalizeSSEFrame(frame, modelId, state) {
 }
 
 function makeGraniteToolState() {
-  return { calls: new Map(), template: null, flushed: new Set(), finishReason: null, receivedDone: false };
+  return {
+    calls: new Map(),
+    template: null,
+    flushed: new Set(),
+    finishReason: null,
+    receivedDone: false,
+    pendingFinishFrames: []
+  };
 }
 
 function recordGraniteToolCalls(chunk, state) {
@@ -399,6 +406,14 @@ async function writeWithBackpressure(res, data) {
   return !res.destroyed && !res.writableEnded;
 }
 
+async function flushGranitePendingFinish(res, graniteState) {
+  while (graniteState.pendingFinishFrames.length) {
+    const frame = graniteState.pendingFinishFrames.shift();
+    if (!(await writeWithBackpressure(res, frame))) return false;
+  }
+  return true;
+}
+
 async function streamUpstream(upstream, res, modelId) {
   const isGranite = getModelKey(modelId) === "granite";
   res.writeHead(upstream.status, {
@@ -436,6 +451,7 @@ async function streamUpstream(upstream, res, modelId) {
         for (const chunk of flushGraniteToolCalls(modelId, graniteState)) {
           if (!(await writeWithBackpressure(res, chunk))) return false;
         }
+        if (!(await flushGranitePendingFinish(res, graniteState))) return false;
       }
       state.receivedDone = true;
       diag.receivedDone = true;
@@ -464,24 +480,20 @@ async function streamUpstream(upstream, res, modelId) {
         const keep = stripped.choices?.some(c =>
           (c.delta && Object.keys(c.delta).length > 0) || c.finish_reason != null
         );
-        if (finish) {
-          for (const out of flushGraniteToolCalls(modelId, graniteState)) {
-            if (!(await writeWithBackpressure(res, out))) return false;
-          }
-          if (keep) {
-            normalizeResponseObject(stripped, modelId);
-            if (!(await writeWithBackpressure(res, `data: ${JSON.stringify(stripped)}\n\n`))) return false;
-          }
-        } else if (keep) {
+        if (keep) {
           normalizeResponseObject(stripped, modelId);
-          if (!(await writeWithBackpressure(res, `data: ${JSON.stringify(stripped)}\n\n`))) return false;
+          const outputFrame = `data: ${JSON.stringify(stripped)}\n\n`;
+          if (finish) {
+            graniteState.pendingFinishFrames.push(outputFrame);
+          } else if (!(await writeWithBackpressure(res, outputFrame))) {
+            return false;
+          }
         }
         return true;
       }
       if (finish) {
-        for (const out of flushGraniteToolCalls(modelId, graniteState)) {
-          if (!(await writeWithBackpressure(res, out))) return false;
-        }
+        graniteState.pendingFinishFrames.push(normalizeSSEFrame(frame, modelId, state));
+        return true;
       }
       return writeWithBackpressure(res, normalizeSSEFrame(frame, modelId, state));
     }
@@ -516,6 +528,7 @@ async function streamUpstream(upstream, res, modelId) {
       for (const out of flushGraniteToolCalls(modelId, graniteState)) {
         if (!(await writeWithBackpressure(res, out))) return;
       }
+      if (!(await flushGranitePendingFinish(res, graniteState))) return;
       console.error("[GRANITE_DIAG]", JSON.stringify({
         stage: "stream_complete",
         version: VERSION,
