@@ -1,7 +1,7 @@
 import http from "node:http";
 import { once } from "node:events";
 
-const VERSION = "V4.35-OPT-RENDER";
+const VERSION = "V4.36-GRANITE-DIAG";
 const PROVIDER = "freeaipower";
 const DEFAULT_MAX_TOKENS = 8192;
 const MAX_REQUEST_BYTES = 20 * 1024 * 1024;
@@ -111,7 +111,8 @@ function normalizeMessages(messages) {
   });
 }
 
-// Granite-specific message compatibility.
+// Granite needs string content for normal messages and null content for assistant tool calls.
+// Flatten tool results into user messages to avoid unsupported role:"tool" payloads.
 function normalizeGraniteMessages(messages) {
   if (!Array.isArray(messages)) return messages;
   const normalized = [];
@@ -122,13 +123,9 @@ function normalizeGraniteMessages(messages) {
     }
     const item = normalizeMessages([message])[0];
     if (item.role === "tool") {
-      const toolName = item.name ? `: ${item.name}` : "";
-      const toolContent = typeof item.content === "string"
-        ? item.content
-        : item.content == null ? "" : String(item.content);
       normalized.push({
         role: "user",
-        content: `[Tool result${toolName}]\n${toolContent}`
+        content: `[Tool result${item.name ? `: ${item.name}` : ""}]\n${typeof item.content === "string" ? item.content : item.content == null ? "" : String(item.content)}`
       });
       continue;
     }
@@ -136,26 +133,21 @@ function normalizeGraniteMessages(messages) {
       normalized.push({ ...item, content: null });
       continue;
     }
-    if (typeof item.content === "string") {
-      normalized.push(item);
-    } else if (item.content === null || item.content === undefined) {
-      normalized.push({ ...item, content: "" });
-    } else {
-      normalized.push({ ...item, content: String(item.content) });
-    }
+    if (typeof item.content === "string") normalized.push(item);
+    else if (item.content === null || item.content === undefined) normalized.push({ ...item, content: "" });
+    else normalized.push({ ...item, content: String(item.content) });
   }
   return normalized;
 }
 
 function buildUpstreamBody(body, model) {
   //console.log("Request stream:", body.stream);
-  const modelKey = getModelKey(model.id);
   const output = {
     ...body,
     model: model.id,
-    messages: modelKey === "granite"
+    messages: getModelKey(model.id) === "granite"
       ? normalizeGraniteMessages(body.messages)
-      : ["qwen", "glm"].includes(modelKey)
+      : ["qwen", "glm"].includes(getModelKey(model.id))
         ? normalizeMessages(body.messages) : body.messages,
     stream: body.stream === true
   };
@@ -309,6 +301,14 @@ async function streamUpstream(upstream, res, modelId) {
   const reader = upstream.body.getReader();
   const decoder = new TextDecoder();
   const state = { receivedDone: false };
+  const graniteDiag = {
+    enabled: getModelKey(modelId) === "granite",
+    events: 0,
+    contentChunks: 0,
+    reasoningChunks: 0,
+    finishReason: null,
+    receivedDone: false
+  };
   let buffer = "";
 
   try {
@@ -326,6 +326,37 @@ async function streamUpstream(upstream, res, modelId) {
         const end = match.index + match[0].length;
         const frame = buffer.slice(0, end);
         buffer = buffer.slice(end);
+
+        if (graniteDiag.enabled) {
+          for (const line of frame.split(/\r?\n/)) {
+            if (!line.startsWith("data:")) continue;
+            const raw = line.slice(5).trim();
+            if (!raw) continue;
+            if (raw === "[DONE]") {
+              graniteDiag.receivedDone = true;
+              continue;
+            }
+            let event;
+            try {
+              event = JSON.parse(raw);
+            } catch {
+              continue;
+            }
+            graniteDiag.events++;
+            const choice = event.choices?.[0];
+            const delta = choice?.delta;
+            if (typeof delta?.content === "string" && delta.content.length) graniteDiag.contentChunks++;
+            if (["reasoning_content", "reasoning"].some(key => typeof delta?.[key] === "string" && delta[key].length)) graniteDiag.reasoningChunks++;
+            if (choice?.finish_reason != null) graniteDiag.finishReason = choice.finish_reason;
+            if (event.error) {
+              console.error("[GRANITE_DIAG]", JSON.stringify({
+                stage: "stream_error_event",
+                version: VERSION,
+                errorType: typeof event.error
+              }));
+            }
+          }
+        }
 
         const normalized = normalizeSSEFrame(frame, modelId, state);
         if (!(await writeWithBackpressure(res, normalized))) {
@@ -359,9 +390,26 @@ async function streamUpstream(upstream, res, modelId) {
       await writeWithBackpressure(res, "data: [DONE]\n\n");
     }
 
+    if (graniteDiag.enabled) {
+      graniteDiag.receivedDone = graniteDiag.receivedDone || state.receivedDone;
+      console.error("[GRANITE_DIAG]", JSON.stringify({
+        stage: "stream_complete",
+        version: VERSION,
+        ...graniteDiag
+      }));
+    }
+
     if (!res.writableEnded && !res.destroyed) res.end();
   } catch (error) {
     console.error("SSE stream error:", error?.message || String(error));
+    if (graniteDiag.enabled) {
+      console.error("[GRANITE_DIAG]", JSON.stringify({
+        stage: "stream_exception",
+        version: VERSION,
+        message: error?.message || String(error),
+        ...graniteDiag
+      }));
+    }
     if (!res.destroyed && !res.writableEnded) res.destroy(error);
     await reader.cancel().catch(() => {});
   } finally {
@@ -446,6 +494,28 @@ async function handleChatCompletions(req, res) {
 
   clearTimeout(timeout);
   res.off("close", onClientClose);
+
+  if (modelKey === "granite") {
+    console.error("[GRANITE_DIAG]", JSON.stringify({
+      stage: "upstream_response",
+      version: VERSION,
+      status: upstream.status,
+      ok: upstream.ok,
+      requestedStream: upstreamBody.stream === true,
+      contentType: upstream.headers.get("content-type"),
+      outgoingMessages: (upstreamBody.messages || []).map((m, index) => ({
+        index,
+        role: m?.role ?? null,
+        contentType: m?.content === null
+          ? "null"
+          : Array.isArray(m?.content)
+            ? "array"
+            : typeof m?.content,
+        hasContent: Object.prototype.hasOwnProperty.call(m || {}, "content"),
+        hasToolCalls: Array.isArray(m?.tool_calls) && m.tool_calls.length > 0
+      }))
+    }));
+  }
 
   const isStreaming = upstreamBody.stream === true;
   if (
