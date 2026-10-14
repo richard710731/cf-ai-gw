@@ -1,7 +1,7 @@
 import http from "node:http";
 import { once } from "node:events";
 
-const VERSION = "V4.38-GRANITE-TOOL-DIAG";
+const VERSION = "V4.39-GRANITE-TOOL-FIX";
 const PROVIDER = "freeaipower";
 const DEFAULT_MAX_TOKENS = 8192;
 const MAX_REQUEST_BYTES = 20 * 1024 * 1024;
@@ -111,23 +111,39 @@ function normalizeMessages(messages) {
   });
 }
 
-// Granite-only: normalize message content and preserve tool protocol fields.
+// Granite-only: normalize content while preserving tool protocol fields.
 function normalizeGraniteMessages(messages) {
   if (!Array.isArray(messages)) return messages;
   return messages.map(message => {
     if (!message || typeof message !== "object" || Array.isArray(message)) return message;
     const item = normalizeMessages([message])[0];
     let content = item.content;
-    if (content === null || content === undefined) {
-      content = "";
-    } else if (typeof content !== "string") {
+    if (content === null || content === undefined) content = "";
+    else if (typeof content !== "string") {
       content = typeof content === "object" ? JSON.stringify(content) : String(content);
     }
     return { ...item, content };
   });
 }
 
-// Diagnostics inspect structure only; argument contents are never logged.
+// Only unwrap a string when it contains a second valid JSON object/array.
+// Invalid or ordinary arguments are returned unchanged.
+function normalizeGraniteToolArguments(raw) {
+  if (typeof raw !== "string") return raw == null ? "" : String(raw);
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+  if (typeof parsed !== "string") return raw;
+  try {
+    const nested = JSON.parse(parsed);
+    if (nested && typeof nested === "object") return JSON.stringify(nested);
+  } catch {}
+  return raw;
+}
+
 function inspectToolArguments(raw) {
   const result = {
     rawType: raw === null ? "null" : Array.isArray(raw) ? "array" : typeof raw,
@@ -140,7 +156,6 @@ function inspectToolArguments(raw) {
     actionsOverLimit: false,
     nestedJsonString: false
   };
-
   let parsed = raw;
   if (typeof raw === "string") {
     try {
@@ -154,28 +169,21 @@ function inspectToolArguments(raw) {
   } else {
     return result;
   }
-
   result.parsedType = parsed === null ? "null" : Array.isArray(parsed) ? "array" : typeof parsed;
-
-  // Detect arguments encoded as a JSON string containing another JSON document.
   if (typeof parsed === "string") {
     try {
       const nested = JSON.parse(parsed);
-      result.nestedJsonString = !!nested && typeof nested === "object" && !Array.isArray(nested);
+      result.nestedJsonString = !!nested && typeof nested === "object";
     } catch {}
     return result;
   }
-
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return result;
-
   result.topLevelKeys = Object.keys(parsed).slice(0, 30);
-
   if (Object.prototype.hasOwnProperty.call(parsed, "actions")) {
     result.actionsType = parsed.actions === null ? "null" : Array.isArray(parsed.actions) ? "array" : typeof parsed.actions;
     result.actionsCount = Array.isArray(parsed.actions) ? parsed.actions.length : null;
     result.actionsOverLimit = Array.isArray(parsed.actions) && parsed.actions.length > 2;
   }
-
   return result;
 }
 
@@ -185,24 +193,18 @@ function logToolCallDiagnostics(stage, toolCalls, diagId) {
     version: VERSION,
     diagId,
     stage,
-    toolCalls: toolCalls.map((tc, index) => {
-      const name = tc?.function?.name || tc?.name || null;
-      const args = tc?.function?.arguments ?? tc?.arguments;
-      return {
-        index,
-        toolName: name,
-        toolCallIdType: tc?.id == null ? String(tc?.id) : typeof tc.id,
-        arguments: inspectToolArguments(args)
-      };
-    })
+    toolCalls: toolCalls.map((tc, index) => ({
+      index,
+      toolName: tc?.function?.name || tc?.name || null,
+      toolCallIdType: tc?.id == null ? String(tc?.id) : typeof tc.id,
+      arguments: inspectToolArguments(tc?.function?.arguments ?? tc?.arguments)
+    }))
   }));
 }
 
 function logGraniteMessageDiagnostics(stage, messages, diagId) {
   if (!Array.isArray(messages)) {
-    console.error("[GRANITE_SHAPE]", JSON.stringify({
-      diagId, stage, messagesType: typeof messages
-    }));
+    console.error("[GRANITE_SHAPE]", JSON.stringify({ diagId, stage, messagesType: typeof messages }));
     return;
   }
   console.error("[GRANITE_SHAPE]", JSON.stringify({
@@ -240,17 +242,12 @@ function buildUpstreamBody(body, model) {
         ? normalizeMessages(body.messages) : body.messages,
     stream: body.stream === true
   };
-
-  if (model.id === "@cf/zai-org/glm-4.7-flash") {
-    delete output.reasoning_effort;
-  }
-
+  if (model.id === "@cf/zai-org/glm-4.7-flash") delete output.reasoning_effort;
   let requested = body.max_completion_tokens ?? body.max_tokens ?? null;
   if (requested !== null) {
     requested = Number(requested);
     if (!Number.isFinite(requested) || requested <= 0) requested = null;
   }
-
   const resolved = Math.min(requested || DEFAULT_MAX_TOKENS, model.maxOutputTokens);
   delete output.max_tokens;
   delete output.max_completion_tokens;
@@ -259,20 +256,16 @@ function buildUpstreamBody(body, model) {
 }
 
 function normalizePrimitive(value) {
-  return typeof value === "number" || typeof value === "boolean"
-    ? String(value)
-    : value;
+  return typeof value === "number" || typeof value === "boolean" ? String(value) : value;
 }
 
 function normalizeResponseObject(data, modelId) {
   if (!data || typeof data !== "object" || Array.isArray(data)) return false;
   let changed = false;
-
   if (data.model !== modelId) {
     data.model = modelId;
     changed = true;
   }
-
   if (Array.isArray(data.choices)) {
     for (const choice of data.choices) {
       if (!choice || typeof choice !== "object" || Array.isArray(choice)) continue;
@@ -304,7 +297,6 @@ function normalizeResponseObject(data, modelId) {
       }
     }
   }
-
   if (data.usage && typeof data.usage === "object" && "neurons" in data.usage) {
     delete data.usage.neurons;
     changed = true;
@@ -318,7 +310,6 @@ function normalizeSSEFrame(frame, modelId, state) {
   const content = ending ? frame.slice(0, -ending.length) : frame;
   const lines = content.split(/\r?\n/);
   let changed = false;
-
   const normalizedLines = lines.map(line => {
     if (!line.startsWith("data:")) return line;
     const raw = line.slice(5).trim();
@@ -338,47 +329,36 @@ function normalizeSSEFrame(frame, modelId, state) {
     changed = true;
     return `data: ${JSON.stringify(chunk)}`;
   });
-
   return changed ? normalizedLines.join("\n") + ending : frame;
 }
 
 async function writeWithBackpressure(res, data) {
   if (res.destroyed || res.writableEnded) return false;
   if (res.write(data)) return true;
-  await Promise.race([
-    once(res, "drain"),
-    once(res, "close")
-  ]).catch(() => {});
+  await Promise.race([once(res, "drain"), once(res, "close")]).catch(() => {});
   return !res.destroyed && !res.writableEnded;
 }
 
+// Assemble fragmented Granite tool calls and emit them as complete arguments.
+// Other models continue to pass through the original SSE frames.
 function recordStreamToolCall(toolState, event) {
-  const choices = Array.isArray(event?.choices) ? event.choices : [];
-  for (const choice of choices) {
+  for (const choice of Array.isArray(event?.choices) ? event.choices : []) {
     const choiceIndex = Number.isInteger(choice?.index) ? choice.index : 0;
-    const calls = choice?.delta?.tool_calls;
-    if (!Array.isArray(calls)) continue;
-
-    for (const tc of calls) {
+    for (const tc of Array.isArray(choice?.delta?.tool_calls) ? choice.delta.tool_calls : []) {
       const toolIndex = Number.isInteger(tc?.index) ? tc.index : 0;
       const key = `${choiceIndex}:${toolIndex}`;
       let entry = toolState.get(key);
       if (!entry) {
         entry = {
-          choiceIndex,
-          toolIndex,
-          id: null,
-          name: "",
-          argumentParts: [],
-          argumentTypes: []
+          choiceIndex, toolIndex, id: null, type: "function", name: "",
+          argumentParts: [], argumentTypes: [], emitted: false
         };
         toolState.set(key, entry);
       }
-
-      if (typeof tc?.id === "string") entry.id = tc.id;
-      if (typeof tc?.function?.name === "string") entry.name += tc.function.name;
-
-      if (tc?.function && Object.prototype.hasOwnProperty.call(tc.function, "arguments")) {
+      if (typeof tc.id === "string") entry.id = tc.id;
+      if (typeof tc.type === "string") entry.type = tc.type;
+      if (typeof tc.function?.name === "string") entry.name += tc.function.name;
+      if (tc.function && Object.prototype.hasOwnProperty.call(tc.function, "arguments")) {
         const args = tc.function.arguments;
         entry.argumentTypes.push(args === null ? "null" : Array.isArray(args) ? "array" : typeof args);
         if (typeof args === "string") entry.argumentParts.push(args);
@@ -388,35 +368,113 @@ function recordStreamToolCall(toolState, event) {
   }
 }
 
-function logStreamToolCallDiagnostics(toolState, diagId) {
-  if (toolState.size === 0) {
-    console.error("[GRANITE_TOOL_ARGS]", JSON.stringify({
-      version: VERSION, diagId, stage: "stream_complete", toolCalls: []
-    }));
-    return;
+function buildGraniteToolFlush(toolState, modelId, template) {
+  const pending = [...toolState.values()]
+    .filter(entry => !entry.emitted)
+    .sort((a, b) => a.choiceIndex - b.choiceIndex || a.toolIndex - b.toolIndex);
+  if (!pending.length) return "";
+  for (const entry of pending) entry.emitted = true;
+  const grouped = new Map();
+  for (const entry of pending) {
+    if (!grouped.has(entry.choiceIndex)) grouped.set(entry.choiceIndex, []);
+    const rawArgs = entry.argumentParts.join("");
+    grouped.get(entry.choiceIndex).push({
+      index: entry.toolIndex,
+      ...(entry.id ? { id: entry.id } : {}),
+      type: entry.type || "function",
+      function: {
+        ...(entry.name ? { name: entry.name } : {}),
+        arguments: normalizeGraniteToolArguments(rawArgs)
+      }
+    });
   }
+  const base = {
+    id: template?.id,
+    object: template?.object || "chat.completion.chunk",
+    created: template?.created ?? Math.floor(Date.now() / 1000),
+    model: modelId
+  };
+  if (template?.system_fingerprint !== undefined) base.system_fingerprint = template.system_fingerprint;
+  const frames = [];
+  for (const [choiceIndex, calls] of grouped) {
+    const event = {
+      ...base,
+      choices: [{ index: choiceIndex, delta: { tool_calls: calls }, finish_reason: null }]
+    };
+    frames.push(`data: ${JSON.stringify(event)}\n\n`);
+  }
+  return frames.join("");
+}
 
-  const toolCalls = [...toolState.values()].sort((a, b) =>
-    a.choiceIndex - b.choiceIndex || a.toolIndex - b.toolIndex
-  ).map(entry => {
-    const raw = entry.argumentParts.join("");
-    return {
+function processGraniteSSEFrame(frame, modelId, state, toolState, streamMeta) {
+  const endingMatch = frame.match(/(\r?\n\r?\n)$/);
+  const ending = endingMatch ? endingMatch[1] : "";
+  const content = ending ? frame.slice(0, -ending.length) : frame;
+  const lines = content.split(/\r?\n/);
+  const dataIndex = lines.findIndex(line => line.startsWith("data:"));
+  if (dataIndex < 0) return normalizeSSEFrame(frame, modelId, state);
+  const raw = lines[dataIndex].slice(5).trim();
+  if (raw === "[DONE]") {
+    const flush = buildGraniteToolFlush(toolState, modelId, streamMeta.template);
+    state.receivedDone = true;
+    return flush + frame;
+  }
+  let event;
+  try {
+    event = JSON.parse(raw);
+  } catch {
+    return frame;
+  }
+  if (!event || typeof event !== "object" || Array.isArray(event)) return frame;
+  const hadToolCalls = (event.choices || []).some(choice => Array.isArray(choice?.delta?.tool_calls) && choice.delta.tool_calls.length);
+  if (hadToolCalls) {
+    streamMeta.template = event;
+    recordStreamToolCall(toolState, event);
+  }
+  const shouldFlush = (event.choices || []).some(choice => choice?.finish_reason === "tool_calls");
+  const flush = shouldFlush ? buildGraniteToolFlush(toolState, modelId, streamMeta.template) : "";
+  if (!hadToolCalls) {
+    const normalized = normalizeSSEFrame(frame, modelId, state);
+    return flush + normalized;
+  }
+  // Remove incremental argument fragments; emit one complete tool call at flush.
+  const copy = JSON.parse(JSON.stringify(event));
+  for (const choice of copy.choices || []) {
+    if (choice?.delta && Array.isArray(choice.delta.tool_calls)) {
+      delete choice.delta.tool_calls;
+    }
+  }
+  const meaningfulChoices = (copy.choices || []).some(choice =>
+    (choice.delta && Object.keys(choice.delta).length > 0) ||
+    choice.finish_reason != null ||
+    Object.keys(choice).some(key => !["index", "delta", "finish_reason"].includes(key))
+  );
+  const hasOtherPayload = Object.keys(copy).some(key => key !== "choices");
+  if (!meaningfulChoices && !hasOtherPayload) return flush;
+  normalizeResponseObject(copy, modelId);
+  lines[dataIndex] = `data: ${JSON.stringify(copy)}`;
+  return flush + lines.join("\n") + ending;
+}
+
+function logStreamToolCallDiagnostics(toolState, diagId) {
+  const toolCalls = [...toolState.values()]
+    .sort((a, b) => a.choiceIndex - b.choiceIndex || a.toolIndex - b.toolIndex)
+    .map(entry => ({
       choiceIndex: entry.choiceIndex,
       toolIndex: entry.toolIndex,
       toolName: entry.name || null,
       toolCallIdPresent: typeof entry.id === "string" && entry.id.length > 0,
       argumentChunkTypes: entry.argumentTypes,
       argumentChunkCount: entry.argumentTypes.length,
-      arguments: inspectToolArguments(raw)
-    };
-  });
-
+      arguments: inspectToolArguments(entry.argumentParts.join(""))
+    }));
   console.error("[GRANITE_TOOL_ARGS]", JSON.stringify({
     version: VERSION, diagId, stage: "stream_complete", toolCalls
   }));
 }
 
 async function streamUpstream(upstream, res, modelId, diagId = null) {
+  const isGranite = getModelKey(modelId) === "granite";
   res.writeHead(upstream.status, {
     ...corsHeaders,
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -424,110 +482,90 @@ async function streamUpstream(upstream, res, modelId, diagId = null) {
     "X-Accel-Buffering": "no",
     "X-Proxy-Version": VERSION,
     "X-Proxy-Model": modelId,
-    "X-Proxy-Repaired": "sse-normalized"
+    "X-Proxy-Repaired": isGranite ? "granite-tool-args-normalized" : "sse-normalized"
   });
-
   if (!upstream.body) {
     await writeWithBackpressure(res, "data: [DONE]\n\n");
     if (!res.destroyed && !res.writableEnded) res.end();
     return;
   }
-
   const reader = upstream.body.getReader();
   const decoder = new TextDecoder();
   const state = { receivedDone: false };
   const graniteDiag = {
-    enabled: getModelKey(modelId) === "granite",
-    events: 0,
-    contentChunks: 0,
-    reasoningChunks: 0,
-    finishReason: null,
-    receivedDone: false
+    enabled: isGranite, events: 0, contentChunks: 0, reasoningChunks: 0,
+    finishReason: null, receivedDone: false
   };
   const streamToolState = new Map();
+  const streamMeta = { template: null };
   let buffer = "";
-
   try {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
       if (!value || !value.length) continue;
       buffer += decoder.decode(value, { stream: true });
-
       while (true) {
         const match = /\r\n\r\n|\n\n/.exec(buffer);
         if (!match) break;
         const end = match.index + match[0].length;
         const frame = buffer.slice(0, end);
         buffer = buffer.slice(end);
-
-        if (graniteDiag.enabled) {
+        if (isGranite) {
           for (const line of frame.split(/\r?\n/)) {
             if (!line.startsWith("data:")) continue;
             const raw = line.slice(5).trim();
-            if (!raw) continue;
-            if (raw === "[DONE]") {
-              graniteDiag.receivedDone = true;
-              continue;
-            }
+            if (!raw || raw === "[DONE]") continue;
             let event;
-            try {
-              event = JSON.parse(raw);
-            } catch {
-              continue;
-            }
+            try { event = JSON.parse(raw); } catch { continue; }
             graniteDiag.events++;
             const choice = event.choices?.[0];
             const delta = choice?.delta;
             if (typeof delta?.content === "string" && delta.content.length) graniteDiag.contentChunks++;
             if (["reasoning_content", "reasoning"].some(key => typeof delta?.[key] === "string" && delta[key].length)) graniteDiag.reasoningChunks++;
             if (choice?.finish_reason != null) graniteDiag.finishReason = choice.finish_reason;
-            recordStreamToolCall(streamToolState, event);
-            if (event.error) {
-              console.error("[GRANITE_DIAG]", JSON.stringify({
-                stage: "stream_error_event", version: VERSION, diagId,
-                errorType: typeof event.error
-              }));
-            }
+            if (event.error) console.error("[GRANITE_DIAG]", JSON.stringify({
+              stage: "stream_error_event", version: VERSION, diagId, errorType: typeof event.error
+            }));
           }
         }
-
-        const normalized = normalizeSSEFrame(frame, modelId, state);
-        if (!(await writeWithBackpressure(res, normalized))) {
+        const output = isGranite
+          ? processGraniteSSEFrame(frame, modelId, state, streamToolState, streamMeta)
+          : normalizeSSEFrame(frame, modelId, state);
+        if (output && !(await writeWithBackpressure(res, output))) {
           await reader.cancel().catch(() => {});
           return;
         }
       }
-
       if (Buffer.byteLength(buffer, "utf8") > MAX_SSE_EVENT_BYTES) {
         throw new Error("SSE event exceeds the 2 MB limit.");
       }
     }
-
     buffer += decoder.decode();
     if (buffer) {
-      const normalized = normalizeSSEFrame(buffer, modelId, state);
-      const finalFrame = /\r?\n\r?\n$/.test(normalized) ? normalized : normalized + "\n\n";
-      if (!(await writeWithBackpressure(res, finalFrame))) return;
+      const output = isGranite
+        ? processGraniteSSEFrame(buffer, modelId, state, streamToolState, streamMeta)
+        : normalizeSSEFrame(buffer, modelId, state);
+      const finalFrame = output && /\r?\n\r?\n$/.test(output) ? output : output ? output + "\n\n" : "";
+      if (finalFrame && !(await writeWithBackpressure(res, finalFrame))) return;
       if (/\bdata:\s*\[DONE\]/.test(buffer)) state.receivedDone = true;
     }
-
-    if (!state.receivedDone) {
-      await writeWithBackpressure(res, "data: [DONE]\n\n");
+    if (isGranite) {
+      const flush = buildGraniteToolFlush(streamToolState, modelId, streamMeta.template);
+      if (flush && !(await writeWithBackpressure(res, flush))) return;
     }
-
-    if (graniteDiag.enabled) {
-      graniteDiag.receivedDone = graniteDiag.receivedDone || state.receivedDone;
+    if (!state.receivedDone) await writeWithBackpressure(res, "data: [DONE]\n\n");
+    if (isGranite) {
+      graniteDiag.receivedDone = state.receivedDone;
       console.error("[GRANITE_DIAG]", JSON.stringify({
         stage: "stream_complete", version: VERSION, diagId, ...graniteDiag
       }));
       logStreamToolCallDiagnostics(streamToolState, diagId);
     }
-
     if (!res.writableEnded && !res.destroyed) res.end();
   } catch (error) {
     console.error("SSE stream error:", error?.message || String(error));
-    if (graniteDiag.enabled) {
+    if (isGranite) {
       console.error("[GRANITE_DIAG]", JSON.stringify({
         stage: "stream_exception", version: VERSION, diagId,
         message: error?.message || String(error), ...graniteDiag
@@ -546,21 +584,18 @@ async function handleChatCompletions(req, res) {
   if (!credentials) {
     return sendError(res, "Missing or invalid Authorization. Use Bearer ACCOUNT_ID:API_TOKEN.", 401);
   }
-
   let body;
   try {
     body = await readRequestBody(req);
   } catch (error) {
     return sendError(res, error.message, error.status || 400);
   }
-
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return sendError(res, "Request body must be a JSON object.", 400);
   }
   if (!Array.isArray(body.messages)) {
     return sendError(res, "The messages field must be an array.", 400);
   }
-
   const modelKey = getModelKey(body.model);
   if (!modelKey) {
     return sendError(
@@ -569,10 +604,8 @@ async function handleChatCompletions(req, res) {
       400
     );
   }
-
   const model = MODELS[modelKey];
   const graniteDiagId = modelKey === "granite" ? `${Date.now()}-${++graniteDiagCounter}` : null;
-
   if (modelKey === "granite") {
     logGraniteMessageDiagnostics("incoming_messages", body.messages, graniteDiagId);
     for (const message of body.messages) {
@@ -581,25 +614,18 @@ async function handleChatCompletions(req, res) {
       }
     }
   }
-
   const upstreamBody = buildUpstreamBody(body, model);
-
   if (modelKey === "granite") {
     logGraniteMessageDiagnostics("outgoing_messages", upstreamBody.messages, graniteDiagId);
   }
-
-  const upstreamUrl =
-    `${UPSTREAM_BASE}/${encodeURIComponent(credentials.accountId)}/ai/v1/chat/completions`;
-
+  const upstreamUrl = `${UPSTREAM_BASE}/${encodeURIComponent(credentials.accountId)}/ai/v1/chat/completions`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 300000);
   timeout.unref?.();
-
   const onClientClose = () => {
     if (!res.writableEnded) controller.abort();
   };
   res.on("close", onClientClose);
-
   let upstream;
   try {
     upstream = await fetch(upstreamUrl, {
@@ -624,10 +650,8 @@ async function handleChatCompletions(req, res) {
       "upstream_error"
     );
   }
-
   clearTimeout(timeout);
   res.off("close", onClientClose);
-
   if (modelKey === "granite") {
     console.error("[GRANITE_DIAG]", JSON.stringify({
       stage: "upstream_response",
@@ -646,12 +670,10 @@ async function handleChatCompletions(req, res) {
       }))
     }));
   }
-
   const isStreaming = upstreamBody.stream === true;
   if (isStreaming && upstream.headers.get("content-type")?.includes("text/event-stream")) {
     return streamUpstream(upstream, res, model.id, graniteDiagId);
   }
-
   const raw = await upstream.text();
   let data;
   try {
@@ -669,18 +691,22 @@ async function handleChatCompletions(req, res) {
       { "X-Proxy-Model": model.id }
     );
   }
-
   if (!upstream.ok) {
     return sendJson(res, data, upstream.status, { "X-Proxy-Model": model.id });
   }
-
   if (modelKey === "granite") {
     for (const choice of data.choices || []) {
       const calls = choice?.message?.tool_calls;
-      if (Array.isArray(calls)) logToolCallDiagnostics("nonstream_response", calls, graniteDiagId);
+      if (Array.isArray(calls)) {
+        logToolCallDiagnostics("nonstream_response", calls, graniteDiagId);
+        for (const call of calls) {
+          if (call?.function && typeof call.function.arguments === "string") {
+            call.function.arguments = normalizeGraniteToolArguments(call.function.arguments);
+          }
+        }
+      }
     }
   }
-
   normalizeResponseObject(data, model.id);
   return sendJson(res, data, upstream.status, {
     "X-Proxy-Model": model.id,
@@ -695,13 +721,11 @@ const server = http.createServer(async (req, res) => {
   } catch {
     return sendError(res, "Invalid request URL.", 400);
   }
-
   const path = url.pathname;
   if (req.method === "OPTIONS") {
     res.writeHead(204, { ...corsHeaders, "X-Proxy-Version": VERSION });
     return res.end();
   }
-
   if (req.method === "GET" && ["/", "/ping", "/health"].includes(path)) {
     return sendJson(res, {
       status: "ok",
@@ -710,19 +734,15 @@ const server = http.createServer(async (req, res) => {
       models: Object.values(MODELS).map(model => model.id)
     });
   }
-
   if (req.method === "GET" && ["/models", "/v1/models"].includes(path)) {
     return sendJson(res, { object: "list", data: buildModelList() });
   }
-
   if (req.method === "POST" && ["/chat/completions", "/v1/chat/completions"].includes(path)) {
     return handleChatCompletions(req, res);
   }
-
   if (req.method === "GET") {
     return sendError(res, `Not found: ${path}`, 404, "not_found_error");
   }
-
   return sendError(res, `Unsupported route: ${req.method} ${path}`, 404, "not_found_error");
 });
 
@@ -731,11 +751,9 @@ server.headersTimeout = 60000;
 server.keepAliveTimeout = 65000;
 
 const PORT = Number(process.env.PORT) || 3000;
-
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`${VERSION} listening on port ${PORT}; provider=${PROVIDER}; models=${Object.keys(MODELS).join(",")}`);
 });
-
 server.on("error", error => {
   console.error("HTTP server error:", error);
 });
