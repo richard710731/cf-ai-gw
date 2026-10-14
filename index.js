@@ -1,7 +1,7 @@
 import http from "node:http";
 import { once } from "node:events";
 
-const VERSION = "V4.41-GRANITE-HISTORY-FIX";
+const VERSION = "V4.42-GRANITE-WIRE-DIAG";
 const PROVIDER = "freeaipower";
 const DEFAULT_MAX_TOKENS = 8192;
 const MAX_REQUEST_BYTES = 20 * 1024 * 1024;
@@ -189,19 +189,14 @@ function repairTrailingJsonClosers(input) {
   return s;
 }
 
-// Granite 專用：保留原始角色與工具關聯，只正規化 content 型別。
 function normalizeGraniteMessages(messages) {
   if (!Array.isArray(messages)) return messages;
   return messages.map(message => {
     if (!message || typeof message !== "object" || Array.isArray(message)) return message;
     const item = { ...message };
-
-    if (Array.isArray(item.content)) {
-      item.content = contentToString(item.content);
-    }
-
+    if (Array.isArray(item.content)) item.content = contentToString(item.content);
     if (item.role === "assistant" && Array.isArray(item.tool_calls) && item.tool_calls.length) {
-      for (const call of item.tool_calls) {
+      item.tool_calls = item.tool_calls.map(call => {
         const fn = call?.function || {};
         const normalizedArgs = normalizeGraniteToolArguments(fn.arguments);
         console.error("[GRANITE_TOOL_ARGS]", JSON.stringify({
@@ -212,21 +207,18 @@ function normalizeGraniteMessages(messages) {
           normalizedValid: normalizedArgs.valid,
           normalizedRepaired: normalizedArgs.repaired
         }));
-        if (call && typeof call === "object") {
-          call.function = { ...fn, arguments: normalizedArgs.value };
-        }
-      }
-      // OpenAI tool-call assistant message: content must be null when no text accompanies the call.
+        return call && typeof call === "object"
+          ? { ...call, function: { ...fn, arguments: normalizedArgs.value } }
+          : call;
+      });
       if (item.content === undefined || item.content === "") item.content = null;
     } else if (item.role === "tool") {
-      // Preserve role and tool_call_id; do not rewrite this as a user message.
       item.content = contentToString(item.content);
     } else if (item.content === undefined) {
       item.content = "";
     } else if (item.content !== null && typeof item.content !== "string") {
       item.content = contentToString(item.content);
     }
-
     return item;
   });
 }
@@ -446,12 +438,10 @@ async function streamUpstream(upstream, res, modelId) {
       if (!(await writeWithBackpressure(res, frame))) return false;
       return true;
     }
-
     let chunk = null;
     if (raw) {
       try { chunk = JSON.parse(raw); } catch {}
     }
-
     if (isGranite && chunk && typeof chunk === "object") {
       diag.events++;
       const choice = chunk.choices?.[0];
@@ -460,10 +450,8 @@ async function streamUpstream(upstream, res, modelId) {
       if (["reasoning_content", "reasoning"].some(k => typeof delta?.[k] === "string" && delta[k].length)) diag.reasoningChunks++;
       if (choice?.finish_reason != null) diag.finishReason = choice.finish_reason;
       recordGraniteToolCalls(chunk, graniteState);
-
       const hasToolDelta = (chunk.choices || []).some(c => Array.isArray(c.delta?.tool_calls) && c.delta.tool_calls.length);
       const finish = (chunk.choices || []).some(c => c.finish_reason === "tool_calls");
-
       if (hasToolDelta) {
         const stripped = structuredClone(chunk);
         for (const c of stripped.choices || []) {
@@ -472,8 +460,6 @@ async function streamUpstream(upstream, res, modelId) {
         const keep = stripped.choices?.some(c =>
           (c.delta && Object.keys(c.delta).length > 0) || c.finish_reason != null
         );
-
-        // 若此事件同時是 tool_calls 結束事件，先送完整工具呼叫，再送 finish 事件。
         if (finish) {
           for (const out of flushGraniteToolCalls(modelId, graniteState)) {
             if (!(await writeWithBackpressure(res, out))) return false;
@@ -488,7 +474,6 @@ async function streamUpstream(upstream, res, modelId) {
         }
         return true;
       }
-
       if (finish) {
         for (const out of flushGraniteToolCalls(modelId, graniteState)) {
           if (!(await writeWithBackpressure(res, out))) return false;
@@ -496,7 +481,6 @@ async function streamUpstream(upstream, res, modelId) {
       }
       return writeWithBackpressure(res, normalizeSSEFrame(frame, modelId, state));
     }
-
     return writeWithBackpressure(res, normalizeSSEFrame(frame, modelId, state));
   }
 
@@ -567,14 +551,20 @@ async function handleChatCompletions(req, res) {
   if (!modelKey) return sendError(res, `Unsupported model. Available models: ${Object.values(MODELS).map(m => m.id).join(", ")}`, 400);
   const model = MODELS[modelKey];
   const upstreamBody = buildUpstreamBody(body, model);
+  const upstreamJson = JSON.stringify(upstreamBody);
   const upstreamUrl = `${UPSTREAM_BASE}/${encodeURIComponent(credentials.accountId)}/ai/v1/chat/completions`;
 
   if (modelKey === "granite") {
-    console.error("[GRANITE_SHAPE]", JSON.stringify({
+    let wireMessages = [];
+    try {
+      const wireBody = JSON.parse(upstreamJson);
+      wireMessages = Array.isArray(wireBody.messages) ? wireBody.messages : [];
+    } catch {}
+    console.error("[GRANITE_WIRE_SHAPE]", JSON.stringify({
       version: VERSION,
-      stage: "outgoing_messages",
-      messageCount: upstreamBody.messages.length,
-      messages: upstreamBody.messages.map((m, index) => ({
+      stage: "serialized_request",
+      messageCount: wireMessages.length,
+      messages: wireMessages.map((m, index) => ({
         index,
         role: m?.role ?? null,
         contentType: m?.content === null ? "null" : Array.isArray(m?.content) ? "array" : typeof m?.content,
@@ -603,7 +593,7 @@ async function handleChatCompletions(req, res) {
         "Content-Type": "application/json",
         Accept: upstreamBody.stream ? "text/event-stream" : "application/json"
       },
-      body: JSON.stringify(upstreamBody),
+      body: upstreamJson,
       signal: controller.signal
     });
   } catch (error) {
