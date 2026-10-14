@@ -1,7 +1,7 @@
 import http from "node:http";
 import { once } from "node:events";
 
-const VERSION = "V4.40-GRANITE-SSE-CHECK";
+const VERSION = "V4.41-GRANITE-HISTORY-FIX";
 const PROVIDER = "freeaipower";
 const DEFAULT_MAX_TOKENS = 8192;
 const MAX_REQUEST_BYTES = 20 * 1024 * 1024;
@@ -80,18 +80,32 @@ async function readRequestBody(req) {
   }
 }
 
+function contentToString(content) {
+  if (typeof content === "string") return content;
+  if (content === null || content === undefined) return "";
+  if (!Array.isArray(content)) {
+    if (typeof content === "object") {
+      if (typeof content.text === "string") return content.text;
+      if (typeof content.content === "string") return content.content;
+      return JSON.stringify(content);
+    }
+    return String(content);
+  }
+  return content.map(item => {
+    if (typeof item === "string") return item;
+    if (!item || typeof item !== "object") return item == null ? "" : String(item);
+    if (item.text !== undefined && item.text !== null) return String(item.text);
+    if (item.content !== undefined && item.content !== null) return String(item.content);
+    if (item.type === "image_url" || item.type === "image") return "[Image content omitted: unsupported by this Granite text adapter]";
+    return "";
+  }).join("\n");
+}
+
 function normalizeMessages(messages) {
   if (!Array.isArray(messages)) return messages;
   return messages.map(message => {
     if (!message || typeof message !== "object" || Array.isArray(message) || !Array.isArray(message.content)) return message;
-    const content = message.content.map(item => {
-      if (typeof item === "string") return item;
-      if (!item || typeof item !== "object") return "";
-      if (item.text !== undefined && item.text !== null) return String(item.text);
-      if (item.content !== undefined && item.content !== null) return String(item.content);
-      return "";
-    }).join("\n");
-    return { ...message, content };
+    return { ...message, content: contentToString(message.content) };
   });
 }
 
@@ -125,7 +139,6 @@ function inspectToolArguments(raw) {
   };
 }
 
-// Normalize double-encoded JSON; repair only unambiguous trailing-comma / missing-closer cases.
 function normalizeGraniteToolArguments(raw) {
   let value = typeof raw === "string" ? raw : JSON.stringify(raw ?? {});
   try {
@@ -176,38 +189,46 @@ function repairTrailingJsonClosers(input) {
   return s;
 }
 
+// Granite 專用：保留原始角色與工具關聯，只正規化 content 型別。
 function normalizeGraniteMessages(messages) {
   if (!Array.isArray(messages)) return messages;
-  const normalized = [];
-  for (const message of messages) {
-    if (!message || typeof message !== "object" || Array.isArray(message)) {
-      normalized.push(message);
-      continue;
+  return messages.map(message => {
+    if (!message || typeof message !== "object" || Array.isArray(message)) return message;
+    const item = { ...message };
+
+    if (Array.isArray(item.content)) {
+      item.content = contentToString(item.content);
     }
-    const item = normalizeMessages([message])[0];
-    if (item.role === "tool") {
-      normalized.push({ role: "user", content: `[Tool result${item.name ? `: ${item.name}` : ""}]\n${typeof item.content === "string" ? item.content : item.content == null ? "" : String(item.content)}` });
-      continue;
-    }
+
     if (item.role === "assistant" && Array.isArray(item.tool_calls) && item.tool_calls.length) {
-      const toolCalls = item.tool_calls.map(call => {
+      for (const call of item.tool_calls) {
         const fn = call?.function || {};
         const normalizedArgs = normalizeGraniteToolArguments(fn.arguments);
         console.error("[GRANITE_TOOL_ARGS]", JSON.stringify({
-          version: VERSION, stage: "incoming_history", toolName: fn.name || null,
-          arguments: inspectToolArguments(fn.arguments), normalizedValid: normalizedArgs.valid,
+          version: VERSION,
+          stage: "incoming_history",
+          toolName: fn.name || null,
+          arguments: inspectToolArguments(fn.arguments),
+          normalizedValid: normalizedArgs.valid,
           normalizedRepaired: normalizedArgs.repaired
         }));
-        return { ...call, function: { ...fn, arguments: normalizedArgs.value } };
-      });
-      normalized.push({ ...item, content: null, tool_calls: toolCalls });
-      continue;
+        if (call && typeof call === "object") {
+          call.function = { ...fn, arguments: normalizedArgs.value };
+        }
+      }
+      // OpenAI tool-call assistant message: content must be null when no text accompanies the call.
+      if (item.content === undefined || item.content === "") item.content = null;
+    } else if (item.role === "tool") {
+      // Preserve role and tool_call_id; do not rewrite this as a user message.
+      item.content = contentToString(item.content);
+    } else if (item.content === undefined) {
+      item.content = "";
+    } else if (item.content !== null && typeof item.content !== "string") {
+      item.content = contentToString(item.content);
     }
-    if (typeof item.content === "string") normalized.push(item);
-    else if (item.content === null || item.content === undefined) normalized.push({ ...item, content: "" });
-    else normalized.push({ ...item, content: String(item.content) });
-  }
-  return normalized;
+
+    return item;
+  });
 }
 
 function buildUpstreamBody(body, model) {
@@ -343,7 +364,9 @@ function flushGraniteToolCalls(modelId, state) {
     state.flushed.add(key);
     const normalized = normalizeGraniteToolArguments(call.arguments);
     console.error("[GRANITE_TOOL_ARGS]", JSON.stringify({
-      version: VERSION, stage: "sse_output_check", toolName: call.name || null,
+      version: VERSION,
+      stage: "sse_output_check",
+      toolName: call.name || null,
       argumentChunkCount: call.argumentChunkCount,
       accumulated: inspectToolArguments(call.arguments),
       output: inspectToolArguments(normalized.value),
@@ -402,6 +425,7 @@ async function streamUpstream(upstream, res, modelId) {
   const graniteState = makeGraniteToolState();
   const diag = { events: 0, contentChunks: 0, reasoningChunks: 0, finishReason: null, receivedDone: false };
   let buffer = "";
+
   async function processFrame(frame) {
     const lines = frame.split(/\r?\n/);
     let raw = null;
@@ -422,10 +446,12 @@ async function streamUpstream(upstream, res, modelId) {
       if (!(await writeWithBackpressure(res, frame))) return false;
       return true;
     }
+
     let chunk = null;
     if (raw) {
       try { chunk = JSON.parse(raw); } catch {}
     }
+
     if (isGranite && chunk && typeof chunk === "object") {
       diag.events++;
       const choice = chunk.choices?.[0];
@@ -434,35 +460,46 @@ async function streamUpstream(upstream, res, modelId) {
       if (["reasoning_content", "reasoning"].some(k => typeof delta?.[k] === "string" && delta[k].length)) diag.reasoningChunks++;
       if (choice?.finish_reason != null) diag.finishReason = choice.finish_reason;
       recordGraniteToolCalls(chunk, graniteState);
+
       const hasToolDelta = (chunk.choices || []).some(c => Array.isArray(c.delta?.tool_calls) && c.delta.tool_calls.length);
       const finish = (chunk.choices || []).some(c => c.finish_reason === "tool_calls");
+
       if (hasToolDelta) {
         const stripped = structuredClone(chunk);
         for (const c of stripped.choices || []) {
           if (c.delta && "tool_calls" in c.delta) delete c.delta.tool_calls;
         }
-        const keep = stripped.choices?.some(c => c.delta && Object.keys(c.delta).length > 0 || c.finish_reason != null);
-        if (keep) {
-          normalizeResponseObject(stripped, modelId);
-          if (!(await writeWithBackpressure(res, `data: ${JSON.stringify(stripped)}\n\n`))) return false;
-        }
+        const keep = stripped.choices?.some(c =>
+          (c.delta && Object.keys(c.delta).length > 0) || c.finish_reason != null
+        );
+
+        // 若此事件同時是 tool_calls 結束事件，先送完整工具呼叫，再送 finish 事件。
         if (finish) {
           for (const out of flushGraniteToolCalls(modelId, graniteState)) {
             if (!(await writeWithBackpressure(res, out))) return false;
           }
+          if (keep) {
+            normalizeResponseObject(stripped, modelId);
+            if (!(await writeWithBackpressure(res, `data: ${JSON.stringify(stripped)}\n\n`))) return false;
+          }
+        } else if (keep) {
+          normalizeResponseObject(stripped, modelId);
+          if (!(await writeWithBackpressure(res, `data: ${JSON.stringify(stripped)}\n\n`))) return false;
         }
         return true;
       }
+
       if (finish) {
         for (const out of flushGraniteToolCalls(modelId, graniteState)) {
           if (!(await writeWithBackpressure(res, out))) return false;
         }
       }
-      const normalized = normalizeSSEFrame(frame, modelId, state);
-      return writeWithBackpressure(res, normalized);
+      return writeWithBackpressure(res, normalizeSSEFrame(frame, modelId, state));
     }
+
     return writeWithBackpressure(res, normalizeSSEFrame(frame, modelId, state));
   }
+
   try {
     while (true) {
       const { value, done } = await reader.read();
@@ -492,16 +529,25 @@ async function streamUpstream(upstream, res, modelId) {
         if (!(await writeWithBackpressure(res, out))) return;
       }
       console.error("[GRANITE_DIAG]", JSON.stringify({
-        stage: "stream_complete", version: VERSION, events: diag.events,
-        contentChunks: diag.contentChunks, reasoningChunks: diag.reasoningChunks,
-        finishReason: diag.finishReason, receivedDone: state.receivedDone
+        stage: "stream_complete",
+        version: VERSION,
+        events: diag.events,
+        contentChunks: diag.contentChunks,
+        reasoningChunks: diag.reasoningChunks,
+        finishReason: diag.finishReason,
+        receivedDone: state.receivedDone
       }));
     }
     if (!state.receivedDone) await writeWithBackpressure(res, "data: [DONE]\n\n");
     if (!res.destroyed && !res.writableEnded) res.end();
   } catch (error) {
     console.error("SSE stream error:", error?.message || String(error));
-    if (isGranite) console.error("[GRANITE_DIAG]", JSON.stringify({ stage: "stream_exception", version: VERSION, message: error?.message || String(error), ...diag }));
+    if (isGranite) console.error("[GRANITE_DIAG]", JSON.stringify({
+      stage: "stream_exception",
+      version: VERSION,
+      message: error?.message || String(error),
+      ...diag
+    }));
     if (!res.destroyed && !res.writableEnded) res.destroy(error);
     await reader.cancel().catch(() => {});
   } finally {
@@ -522,13 +568,18 @@ async function handleChatCompletions(req, res) {
   const model = MODELS[modelKey];
   const upstreamBody = buildUpstreamBody(body, model);
   const upstreamUrl = `${UPSTREAM_BASE}/${encodeURIComponent(credentials.accountId)}/ai/v1/chat/completions`;
+
   if (modelKey === "granite") {
     console.error("[GRANITE_SHAPE]", JSON.stringify({
-      version: VERSION, stage: "outgoing_messages", messageCount: upstreamBody.messages.length,
+      version: VERSION,
+      stage: "outgoing_messages",
+      messageCount: upstreamBody.messages.length,
       messages: upstreamBody.messages.map((m, index) => ({
-        index, role: m?.role ?? null,
+        index,
+        role: m?.role ?? null,
         contentType: m?.content === null ? "null" : Array.isArray(m?.content) ? "array" : typeof m?.content,
         hasContent: Object.prototype.hasOwnProperty.call(m || {}, "content"),
+        toolCallId: m?.tool_call_id ?? null,
         toolCalls: (m?.tool_calls || []).map(c => ({
           functionName: c?.function?.name || null,
           arguments: inspectToolArguments(c?.function?.arguments)
@@ -536,12 +587,14 @@ async function handleChatCompletions(req, res) {
       }))
     }));
   }
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 300000);
   timeout.unref?.();
   const onClientClose = () => { if (!res.writableEnded) controller.abort(); };
   res.on("close", onClientClose);
   let upstream;
+
   try {
     upstream = await fetch(upstreamUrl, {
       method: "POST",
@@ -560,40 +613,58 @@ async function handleChatCompletions(req, res) {
     console.error("Upstream request error:", error?.message || String(error));
     return sendError(res, `Cloudflare upstream request failed: ${error?.message || String(error)}`, 502, "upstream_error");
   }
+
   clearTimeout(timeout);
   res.off("close", onClientClose);
+
   if (modelKey === "granite") {
     console.error("[GRANITE_DIAG]", JSON.stringify({
-      stage: "upstream_response", version: VERSION, status: upstream.status,
-      ok: upstream.ok, requestedStream: upstreamBody.stream === true,
+      stage: "upstream_response",
+      version: VERSION,
+      status: upstream.status,
+      ok: upstream.ok,
+      requestedStream: upstreamBody.stream === true,
       contentType: upstream.headers.get("content-type")
     }));
   }
+
   if (upstreamBody.stream === true && upstream.headers.get("content-type")?.includes("text/event-stream")) {
     return streamUpstream(upstream, res, model.id);
   }
+
   const raw = await upstream.text();
   let data;
   try { data = JSON.parse(raw); }
   catch {
-    return sendJson(res, { error: { message: raw || `Cloudflare returned HTTP ${upstream.status}.`, type: "upstream_error" } }, upstream.ok ? 502 : upstream.status, { "X-Proxy-Model": model.id });
+    return sendJson(res, {
+      error: { message: raw || `Cloudflare returned HTTP ${upstream.status}.`, type: "upstream_error" }
+    }, upstream.ok ? 502 : upstream.status, { "X-Proxy-Model": model.id });
   }
+
   if (!upstream.ok) return sendJson(res, data, upstream.status, { "X-Proxy-Model": model.id });
+
   if (modelKey === "granite" && Array.isArray(data.choices)) {
     for (const choice of data.choices) {
       for (const call of choice?.message?.tool_calls || []) {
         const normalized = normalizeGraniteToolArguments(call?.function?.arguments);
         call.function.arguments = normalized.value;
         console.error("[GRANITE_TOOL_ARGS]", JSON.stringify({
-          version: VERSION, stage: "json_output_check", toolName: call?.function?.name || null,
-          output: inspectToolArguments(normalized.value), normalizedValid: normalized.valid,
+          version: VERSION,
+          stage: "json_output_check",
+          toolName: call?.function?.name || null,
+          output: inspectToolArguments(normalized.value),
+          normalizedValid: normalized.valid,
           normalizedRepaired: normalized.repaired
         }));
       }
     }
   }
+
   normalizeResponseObject(data, model.id);
-  return sendJson(res, data, upstream.status, { "X-Proxy-Model": model.id, "X-Proxy-Repaired": "json-normalized" });
+  return sendJson(res, data, upstream.status, {
+    "X-Proxy-Model": model.id,
+    "X-Proxy-Repaired": "json-normalized"
+  });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -601,12 +672,18 @@ const server = http.createServer(async (req, res) => {
   try { url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`); }
   catch { return sendError(res, "Invalid request URL.", 400); }
   const path = url.pathname;
+
   if (req.method === "OPTIONS") {
     res.writeHead(204, { ...corsHeaders, "X-Proxy-Version": VERSION });
     return res.end();
   }
   if (req.method === "GET" && ["/", "/ping", "/health"].includes(path)) {
-    return sendJson(res, { status: "ok", version: VERSION, provider: PROVIDER, models: Object.values(MODELS).map(model => model.id) });
+    return sendJson(res, {
+      status: "ok",
+      version: VERSION,
+      provider: PROVIDER,
+      models: Object.values(MODELS).map(model => model.id)
+    });
   }
   if (req.method === "GET" && ["/models", "/v1/models"].includes(path)) {
     return sendJson(res, { object: "list", data: buildModelList() });
@@ -622,6 +699,7 @@ server.requestTimeout = 300000;
 server.headersTimeout = 60000;
 server.keepAliveTimeout = 65000;
 const PORT = Number(process.env.PORT) || 3000;
+
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`${VERSION} listening on port ${PORT}; provider=${PROVIDER}; models=${Object.keys(MODELS).join(",")}`);
 });
