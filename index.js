@@ -116,40 +116,65 @@ function normalizeMessages(messages) {
 function normalizeGraniteMessages(messages) {
   if (!Array.isArray(messages)) return messages;
   const normalized = [];
+
   for (const message of messages) {
     if (!message || typeof message !== "object" || Array.isArray(message)) {
       normalized.push(message);
       continue;
     }
+
     const item = normalizeMessages([message])[0];
+
     if (item.role === "tool") {
+      const result = typeof item.content === "string"
+        ? item.content
+        : item.content == null ? "" : String(item.content);
+
       normalized.push({
         role: "user",
-        content: `[Tool result${item.name ? `: ${item.name}` : ""}]\n${typeof item.content === "string" ? item.content : item.content == null ? "" : String(item.content)}`
+        content: `<tool_response>\n${result}\n</tool_response>`
       });
       continue;
     }
+
     if (item.role === "assistant" && Array.isArray(item.tool_calls) && item.tool_calls.length > 0) {
       const calls = item.tool_calls.map(tc => {
         const name = tc?.function?.name || "unknown";
-        const args = typeof tc?.function?.arguments === "string"
-          ? tc.function.arguments
-          : JSON.stringify(tc?.function?.arguments ?? {});
-        return `[Tool call: ${name}]\n${args}`;
+        let args = tc?.function?.arguments ?? "{}";
+
+        if (typeof args === "string") {
+          try {
+            args = JSON.parse(args);
+          } catch {
+            args = args;
+          }
+        }
+
+        return `<tool_call>\n${JSON.stringify({
+          name,
+          arguments: args
+        })}\n</tool_call>`;
       }).join("\n");
+
+      const content = typeof item.content === "string" ? item.content.trim() : "";
+
       normalized.push({
         role: "assistant",
-        content: [typeof item.content === "string" ? item.content : "", calls].filter(Boolean).join("\n")
+        content: [content, calls].filter(Boolean).join("\n")
       });
       continue;
     }
-    if (typeof item.content === "string") normalized.push(item);
-    else if (item.content === null || item.content === undefined) normalized.push({ ...item, content: "" });
-    else normalized.push({ ...item, content: String(item.content) });
+
+    if (typeof item.content === "string") {
+      normalized.push(item);
+    } else if (item.content === null || item.content === undefined) {
+      normalized.push({ ...item, content: "" });
+    } else {
+      normalized.push({ ...item, content: String(item.content) });
+    }
   }
   return normalized;
 }
-
 
 // Granite-only structural diagnostics. Does not modify messages or log prompt/tool argument contents.
 function logGraniteMessageDiagnostics(stage, messages, diagId) {
