@@ -130,7 +130,17 @@ function normalizeGraniteMessages(messages) {
       continue;
     }
     if (item.role === "assistant" && Array.isArray(item.tool_calls) && item.tool_calls.length > 0) {
-      normalized.push({ ...item, content: null });
+      const calls = item.tool_calls.map(tc => {
+        const name = tc?.function?.name || "unknown";
+        const args = typeof tc?.function?.arguments === "string"
+          ? tc.function.arguments
+          : JSON.stringify(tc?.function?.arguments ?? {});
+        return `[Tool call: ${name}]\n${args}`;
+      }).join("\n");
+      normalized.push({
+        role: "assistant",
+        content: [typeof item.content === "string" ? item.content : "", calls].filter(Boolean).join("\n")
+      });
       continue;
     }
     if (typeof item.content === "string") normalized.push(item);
@@ -139,6 +149,7 @@ function normalizeGraniteMessages(messages) {
   }
   return normalized;
 }
+
 
 // Granite-only structural diagnostics. Does not modify messages or log prompt/tool argument contents.
 function logGraniteMessageDiagnostics(stage, messages, diagId) {
