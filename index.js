@@ -1,7 +1,7 @@
 import http from "node:http";
 import { once } from "node:events";
 
-const VERSION = "V4.36-GRANITE-DIAG";
+const VERSION = "V4.37-GRANITE-TOOLS";
 const PROVIDER = "freeaipower";
 const DEFAULT_MAX_TOKENS = 8192;
 const MAX_REQUEST_BYTES = 20 * 1024 * 1024;
@@ -94,7 +94,6 @@ async function readRequestBody(req) {
   }
 }
 
-// Normalize OpenAI text content arrays while preserving other message fields.
 function normalizeMessages(messages) {
   if (!Array.isArray(messages)) return messages;
   return messages.map(message => {
@@ -112,71 +111,38 @@ function normalizeMessages(messages) {
   });
 }
 
-// Granite-specific normalization; this function is unchanged by the added diagnostics.
+// Granite-only fix: normalize content but preserve the standard tool-call protocol.
 function normalizeGraniteMessages(messages) {
   if (!Array.isArray(messages)) return messages;
-  const normalized = [];
-
-  for (const message of messages) {
-    if (!message || typeof message !== "object" || Array.isArray(message)) {
-      normalized.push(message);
-      continue;
-    }
+  return messages.map(message => {
+    if (!message || typeof message !== "object" || Array.isArray(message)) return message;
 
     const item = normalizeMessages([message])[0];
+    let content = item.content;
 
+    if (content === null || content === undefined) {
+      content = "";
+    } else if (typeof content !== "string") {
+      content = typeof content === "object"
+        ? JSON.stringify(content)
+        : String(content);
+    }
+
+    // Preserve assistant tool_calls and their original function.arguments.
+    // Do not serialize tool calls into plain-text <tool_call> markers.
+    if (item.role === "assistant" && Array.isArray(item.tool_calls)) {
+      return { ...item, content };
+    }
+
+    // Preserve tool role, tool_call_id and other protocol fields.
     if (item.role === "tool") {
-      const result = typeof item.content === "string"
-        ? item.content
-        : item.content == null ? "" : String(item.content);
-
-      normalized.push({
-        role: "user",
-        content: `<tool_response>\n${result}\n</tool_response>`
-      });
-      continue;
+      return { ...item, content };
     }
 
-    if (item.role === "assistant" && Array.isArray(item.tool_calls) && item.tool_calls.length > 0) {
-      const calls = item.tool_calls.map(tc => {
-        const name = tc?.function?.name || "unknown";
-        let args = tc?.function?.arguments ?? "{}";
-
-        if (typeof args === "string") {
-          try {
-            args = JSON.parse(args);
-          } catch {
-            args = args;
-          }
-        }
-
-        return `<tool_call>\n${JSON.stringify({
-          name,
-          arguments: args
-        })}\n</tool_call>`;
-      }).join("\n");
-
-      const content = typeof item.content === "string" ? item.content.trim() : "";
-
-      normalized.push({
-        role: "assistant",
-        content: [content, calls].filter(Boolean).join("\n")
-      });
-      continue;
-    }
-
-    if (typeof item.content === "string") {
-      normalized.push(item);
-    } else if (item.content === null || item.content === undefined) {
-      normalized.push({ ...item, content: "" });
-    } else {
-      normalized.push({ ...item, content: String(item.content) });
-    }
-  }
-  return normalized;
+    return { ...item, content };
+  });
 }
 
-// Granite-only structural diagnostics. Does not modify messages or log prompt/tool argument contents.
 function logGraniteMessageDiagnostics(stage, messages, diagId) {
   if (!Array.isArray(messages)) {
     console.error("[GRANITE_SHAPE]", JSON.stringify({
