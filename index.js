@@ -1,7 +1,7 @@
 import http from "node:http";
 import { once } from "node:events";
 
-const VERSION = "V4.43-GRANITE-EMPTY-CONTENT";
+const VERSION = "V4.44-GRANITE-SUGGEST-DIAG";
 const PROVIDER = "freeaipower";
 const DEFAULT_MAX_TOKENS = 8192;
 const MAX_REQUEST_BYTES = 20 * 1024 * 1024;
@@ -203,6 +203,8 @@ function normalizeGraniteMessages(messages) {
           version: VERSION,
           stage: "incoming_history",
           toolName: fn.name || null,
+          rawArguments: typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments ?? null),
+          normalizedArguments: normalizedArgs.value,
           arguments: inspectToolArguments(fn.arguments),
           normalizedValid: normalizedArgs.valid,
           normalizedRepaired: normalizedArgs.repaired
@@ -360,6 +362,8 @@ function flushGraniteToolCalls(modelId, state) {
       stage: "sse_output_check",
       toolName: call.name || null,
       argumentChunkCount: call.argumentChunkCount,
+      rawArguments: call.arguments,
+      normalizedArguments: normalized.value,
       accumulated: inspectToolArguments(call.arguments),
       output: inspectToolArguments(normalized.value),
       outputMatchesAccumulated: normalized.value === call.arguments,
@@ -637,15 +641,17 @@ async function handleChatCompletions(req, res) {
     for (const choice of data.choices) {
       for (const call of choice?.message?.tool_calls || []) {
         const normalized = normalizeGraniteToolArguments(call?.function?.arguments);
-        call.function.arguments = normalized.value;
         console.error("[GRANITE_TOOL_ARGS]", JSON.stringify({
           version: VERSION,
           stage: "json_output_check",
           toolName: call?.function?.name || null,
+          rawArguments: typeof call?.function?.arguments === "string" ? call.function.arguments : JSON.stringify(call?.function?.arguments ?? null),
+          normalizedArguments: normalized.value,
           output: inspectToolArguments(normalized.value),
           normalizedValid: normalized.valid,
           normalizedRepaired: normalized.repaired
         }));
+        call.function.arguments = normalized.value;
       }
     }
   }
