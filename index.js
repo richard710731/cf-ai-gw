@@ -1,7 +1,7 @@
 import http from "node:http";
 import { once } from "node:events";
 
-const VERSION = "V4.42-GRANITE-WIRE-DIAG";
+const VERSION = "V4.43-GRANITE-EMPTY-CONTENT";
 const PROVIDER = "freeaipower";
 const DEFAULT_MAX_TOKENS = 8192;
 const MAX_REQUEST_BYTES = 20 * 1024 * 1024;
@@ -211,7 +211,7 @@ function normalizeGraniteMessages(messages) {
           ? { ...call, function: { ...fn, arguments: normalizedArgs.value } }
           : call;
       });
-      if (item.content === undefined || item.content === "") item.content = null;
+      if (item.content === undefined || item.content === null || item.content === "") item.content = "";
     } else if (item.role === "tool") {
       item.content = contentToString(item.content);
     } else if (item.content === undefined) {
