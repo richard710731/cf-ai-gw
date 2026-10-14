@@ -7,6 +7,7 @@ const DEFAULT_MAX_TOKENS = 8192;
 const MAX_REQUEST_BYTES = 20 * 1024 * 1024;
 const MAX_SSE_EVENT_BYTES = 2 * 1024 * 1024;
 const UPSTREAM_BASE = "https://api.cloudflare.com/client/v4/accounts";
+let graniteDiagCounter = 0;
 
 const MODELS = {
   qwen: { id: "@cf/qwen/qwen3-30b-a3b-fp8", contextWindow: 32768, maxOutputTokens: 8192 },
@@ -111,8 +112,7 @@ function normalizeMessages(messages) {
   });
 }
 
-// Granite needs string content for normal messages and null content for assistant tool calls.
-// Flatten tool results into user messages to avoid unsupported role:"tool" payloads.
+// Granite-specific normalization; this function is unchanged by the added diagnostics.
 function normalizeGraniteMessages(messages) {
   if (!Array.isArray(messages)) return messages;
   const normalized = [];
@@ -140,14 +140,46 @@ function normalizeGraniteMessages(messages) {
   return normalized;
 }
 
+// Granite-only structural diagnostics. Does not modify messages or log prompt/tool argument contents.
+function logGraniteMessageDiagnostics(stage, messages, diagId) {
+  if (!Array.isArray(messages)) {
+    console.error("[GRANITE_SHAPE]", JSON.stringify({
+      diagId, stage, messagesType: typeof messages
+    }));
+    return;
+  }
+  console.error("[GRANITE_SHAPE]", JSON.stringify({
+    diagId,
+    stage,
+    messageCount: messages.length,
+    messages: messages.map((m, index) => ({
+      index,
+      role: m?.role ?? null,
+      contentType: m?.content === null ? "null" : Array.isArray(m?.content) ? "array" : typeof m?.content,
+      hasContent: !!m && Object.prototype.hasOwnProperty.call(m, "content"),
+      toolCallIdType: m?.tool_call_id == null ? String(m?.tool_call_id) : typeof m.tool_call_id,
+      nameType: m?.name == null ? String(m?.name) : typeof m.name,
+      toolCallsType: Array.isArray(m?.tool_calls) ? "array" : typeof m?.tool_calls,
+      toolCalls: Array.isArray(m?.tool_calls) ? m.tool_calls.map(tc => ({
+        idType: typeof tc?.id,
+        type: tc?.type ?? null,
+        functionNameType: typeof tc?.function?.name,
+        functionName: typeof tc?.function?.name === "string" ? tc.function.name : null,
+        argumentsType: typeof tc?.function?.arguments,
+        argumentsLength: typeof tc?.function?.arguments === "string" ? tc.function.arguments.length : null
+      })) : []
+    }))
+  }));
+}
+
 function buildUpstreamBody(body, model) {
-  //console.log("Request stream:", body.stream);
+  const modelKey = getModelKey(model.id);
   const output = {
     ...body,
     model: model.id,
-    messages: getModelKey(model.id) === "granite"
+    messages: modelKey === "granite"
       ? normalizeGraniteMessages(body.messages)
-      : ["qwen", "glm"].includes(getModelKey(model.id))
+      : ["qwen", "glm"].includes(modelKey)
         ? normalizeMessages(body.messages) : body.messages,
     stream: body.stream === true
   };
@@ -175,7 +207,6 @@ function normalizePrimitive(value) {
     : value;
 }
 
-// Returns true when any normalization changed the response.
 function normalizeResponseObject(data, modelId) {
   if (!data || typeof data !== "object" || Array.isArray(data)) return false;
   let changed = false;
@@ -188,7 +219,6 @@ function normalizeResponseObject(data, modelId) {
   if (Array.isArray(data.choices)) {
     for (const choice of data.choices) {
       if (!choice || typeof choice !== "object" || Array.isArray(choice)) continue;
-
       if ("matched_stop" in choice) {
         delete choice.matched_stop;
         changed = true;
@@ -197,24 +227,16 @@ function normalizeResponseObject(data, modelId) {
         delete choice.token_ids;
         changed = true;
       }
-
       for (const field of ["delta", "message"]) {
         const obj = choice[field];
         if (!obj || typeof obj !== "object" || Array.isArray(obj)) continue;
-
         for (const [key, value] of Object.entries(obj)) {
-          // Preserve null content and other fields; remove null reasoning
-          // fields only, which may be rejected by strict clients.
           if (key === "reasoning_content" && value === null) {
             delete obj[key];
             changed = true;
             continue;
           }
-
-          if (
-            ["content", "reasoning", "reasoning_content"].includes(key) &&
-            value !== null
-          ) {
+          if (["content", "reasoning", "reasoning_content"].includes(key) && value !== null) {
             const normalized = normalizePrimitive(value);
             if (normalized !== value) {
               obj[key] = normalized;
@@ -230,7 +252,6 @@ function normalizeResponseObject(data, modelId) {
     delete data.usage.neurons;
     changed = true;
   }
-
   return changed;
 }
 
@@ -245,7 +266,6 @@ function normalizeSSEFrame(frame, modelId, state) {
     if (!line.startsWith("data:")) return line;
     const raw = line.slice(5).trim();
     if (!raw) return line;
-
     if (raw === "[DONE]") {
       state.receivedDone = true;
       return line;
@@ -257,9 +277,7 @@ function normalizeSSEFrame(frame, modelId, state) {
     } catch {
       return line;
     }
-
     if (!chunk || typeof chunk !== "object" || Array.isArray(chunk)) return line;
-
     if (!normalizeResponseObject(chunk, modelId)) return line;
     changed = true;
     return `data: ${JSON.stringify(chunk)}`;
@@ -271,17 +289,14 @@ function normalizeSSEFrame(frame, modelId, state) {
 async function writeWithBackpressure(res, data) {
   if (res.destroyed || res.writableEnded) return false;
   if (res.write(data)) return true;
-
-  // Stop waiting if the client disconnects before drain.
   await Promise.race([
     once(res, "drain"),
     once(res, "close")
   ]).catch(() => {});
-
   return !res.destroyed && !res.writableEnded;
 }
 
-async function streamUpstream(upstream, res, modelId) {
+async function streamUpstream(upstream, res, modelId, diagId = null) {
   res.writeHead(upstream.status, {
     ...corsHeaders,
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -316,13 +331,11 @@ async function streamUpstream(upstream, res, modelId) {
       const { value, done } = await reader.read();
       if (done) break;
       if (!value || !value.length) continue;
-
       buffer += decoder.decode(value, { stream: true });
 
       while (true) {
         const match = /\r\n\r\n|\n\n/.exec(buffer);
         if (!match) break;
-
         const end = match.index + match[0].length;
         const frame = buffer.slice(0, end);
         buffer = buffer.slice(end);
@@ -350,8 +363,7 @@ async function streamUpstream(upstream, res, modelId) {
             if (choice?.finish_reason != null) graniteDiag.finishReason = choice.finish_reason;
             if (event.error) {
               console.error("[GRANITE_DIAG]", JSON.stringify({
-                stage: "stream_error_event",
-                version: VERSION,
+                stage: "stream_error_event", version: VERSION, diagId,
                 errorType: typeof event.error
               }));
             }
@@ -371,18 +383,10 @@ async function streamUpstream(upstream, res, modelId) {
     }
 
     buffer += decoder.decode();
-
     if (buffer) {
-      // A final event may arrive without its terminating blank line.
-      // Add a delimiter so the next [DONE] cannot merge into its data.
       const normalized = normalizeSSEFrame(buffer, modelId, state);
-      const finalFrame = /\r?\n\r?\n$/.test(normalized)
-        ? normalized
-        : normalized + "\n\n";
-
+      const finalFrame = /\r?\n\r?\n$/.test(normalized) ? normalized : normalized + "\n\n";
       if (!(await writeWithBackpressure(res, finalFrame))) return;
-
-      // A final event might itself contain [DONE].
       if (/\bdata:\s*\[DONE\]/.test(buffer)) state.receivedDone = true;
     }
 
@@ -393,21 +397,16 @@ async function streamUpstream(upstream, res, modelId) {
     if (graniteDiag.enabled) {
       graniteDiag.receivedDone = graniteDiag.receivedDone || state.receivedDone;
       console.error("[GRANITE_DIAG]", JSON.stringify({
-        stage: "stream_complete",
-        version: VERSION,
-        ...graniteDiag
+        stage: "stream_complete", version: VERSION, diagId, ...graniteDiag
       }));
     }
-
     if (!res.writableEnded && !res.destroyed) res.end();
   } catch (error) {
     console.error("SSE stream error:", error?.message || String(error));
     if (graniteDiag.enabled) {
       console.error("[GRANITE_DIAG]", JSON.stringify({
-        stage: "stream_exception",
-        version: VERSION,
-        message: error?.message || String(error),
-        ...graniteDiag
+        stage: "stream_exception", version: VERSION, diagId,
+        message: error?.message || String(error), ...graniteDiag
       }));
     }
     if (!res.destroyed && !res.writableEnded) res.destroy(error);
@@ -420,11 +419,7 @@ async function streamUpstream(upstream, res, modelId) {
 async function handleChatCompletions(req, res) {
   const credentials = parseCredentials(req);
   if (!credentials) {
-    return sendError(
-      res,
-      "Missing or invalid Authorization. Use Bearer ACCOUNT_ID:API_TOKEN.",
-      401
-    );
+    return sendError(res, "Missing or invalid Authorization. Use Bearer ACCOUNT_ID:API_TOKEN.", 401);
   }
 
   let body;
@@ -451,7 +446,18 @@ async function handleChatCompletions(req, res) {
   }
 
   const model = MODELS[modelKey];
+  const graniteDiagId = modelKey === "granite" ? `${Date.now()}-${++graniteDiagCounter}` : null;
+
+  if (modelKey === "granite") {
+    logGraniteMessageDiagnostics("incoming_messages", body.messages, graniteDiagId);
+  }
+
   const upstreamBody = buildUpstreamBody(body, model);
+
+  if (modelKey === "granite") {
+    logGraniteMessageDiagnostics("outgoing_messages", upstreamBody.messages, graniteDiagId);
+  }
+
   const upstreamUrl =
     `${UPSTREAM_BASE}/${encodeURIComponent(credentials.accountId)}/ai/v1/chat/completions`;
 
@@ -459,7 +465,6 @@ async function handleChatCompletions(req, res) {
   const timeout = setTimeout(() => controller.abort(), 300000);
   timeout.unref?.();
 
-  // Abort the upstream request when the client disconnects.
   const onClientClose = () => {
     if (!res.writableEnded) controller.abort();
   };
@@ -480,9 +485,7 @@ async function handleChatCompletions(req, res) {
   } catch (error) {
     clearTimeout(timeout);
     res.off("close", onClientClose);
-
     if (error?.name === "AbortError" && res.destroyed) return;
-
     console.error("Upstream request error:", error?.message || String(error));
     return sendError(
       res,
@@ -499,6 +502,7 @@ async function handleChatCompletions(req, res) {
     console.error("[GRANITE_DIAG]", JSON.stringify({
       stage: "upstream_response",
       version: VERSION,
+      diagId: graniteDiagId,
       status: upstream.status,
       ok: upstream.ok,
       requestedStream: upstreamBody.stream === true,
@@ -506,11 +510,7 @@ async function handleChatCompletions(req, res) {
       outgoingMessages: (upstreamBody.messages || []).map((m, index) => ({
         index,
         role: m?.role ?? null,
-        contentType: m?.content === null
-          ? "null"
-          : Array.isArray(m?.content)
-            ? "array"
-            : typeof m?.content,
+        contentType: m?.content === null ? "null" : Array.isArray(m?.content) ? "array" : typeof m?.content,
         hasContent: Object.prototype.hasOwnProperty.call(m || {}, "content"),
         hasToolCalls: Array.isArray(m?.tool_calls) && m.tool_calls.length > 0
       }))
@@ -518,16 +518,12 @@ async function handleChatCompletions(req, res) {
   }
 
   const isStreaming = upstreamBody.stream === true;
-  if (
-    isStreaming &&
-    upstream.headers.get("content-type")?.includes("text/event-stream")
-  ) {
-    return streamUpstream(upstream, res, model.id);
+  if (isStreaming && upstream.headers.get("content-type")?.includes("text/event-stream")) {
+    return streamUpstream(upstream, res, model.id, graniteDiagId);
   }
 
   const raw = await upstream.text();
   let data;
-
   try {
     data = JSON.parse(raw);
   } catch {
@@ -545,7 +541,6 @@ async function handleChatCompletions(req, res) {
   }
 
   if (!upstream.ok) {
-    // Keep Cloudflare's original error details for diagnosis.
     return sendJson(res, data, upstream.status, { "X-Proxy-Model": model.id });
   }
 
@@ -558,7 +553,6 @@ async function handleChatCompletions(req, res) {
 
 const server = http.createServer(async (req, res) => {
   let url;
-
   try {
     url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
   } catch {
@@ -566,7 +560,6 @@ const server = http.createServer(async (req, res) => {
   }
 
   const path = url.pathname;
-
   if (req.method === "OPTIONS") {
     res.writeHead(204, { ...corsHeaders, "X-Proxy-Version": VERSION });
     return res.end();
@@ -585,10 +578,7 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, { object: "list", data: buildModelList() });
   }
 
-  if (
-    req.method === "POST" &&
-    ["/chat/completions", "/v1/chat/completions"].includes(path)
-  ) {
+  if (req.method === "POST" && ["/chat/completions", "/v1/chat/completions"].includes(path)) {
     return handleChatCompletions(req, res);
   }
 
@@ -596,12 +586,7 @@ const server = http.createServer(async (req, res) => {
     return sendError(res, `Not found: ${path}`, 404, "not_found_error");
   }
 
-  return sendError(
-    res,
-    `Unsupported route: ${req.method} ${path}`,
-    404,
-    "not_found_error"
-  );
+  return sendError(res, `Unsupported route: ${req.method} ${path}`, 404, "not_found_error");
 });
 
 server.requestTimeout = 300000;
@@ -611,9 +596,7 @@ server.keepAliveTimeout = 65000;
 const PORT = Number(process.env.PORT) || 3000;
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `${VERSION} listening on port ${PORT}; provider=${PROVIDER}; models=${Object.keys(MODELS).join(",")}`
-  );
+  console.log(`${VERSION} listening on port ${PORT}; provider=${PROVIDER}; models=${Object.keys(MODELS).join(",")}`);
 });
 
 server.on("error", error => {
